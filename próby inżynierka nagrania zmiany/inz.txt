@@ -1,0 +1,44 @@
+import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import ArticulationCfg
+
+PORZADKI_ROBOT_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=r"C:\Users\jasie\Desktop\inzynierkaizak.usd",  # <-- PAMIĘTAJ O PODMIANIE ŚCIEŻKI
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=4,
+            solver_velocity_iteration_count=0,
+        ),
+    ),
+
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.2),  # Wysokość spawnu
+        joint_pos={
+            ".*": 0.0
+        },
+    ),
+
+    actuators={
+        "wszystkie_serwa": ImplicitActuatorCfg(
+            joint_names_expr=[".*"],
+
+            # --- Osiągi dla Waveshare ST3215 ---
+            effort_limit_sim=3.35,  # Max siła serwa (ok. 30 kg.cm -> 3 Nm)
+            velocity_limit_sim=5.24,  # Max prędkość (ok. 43 obr/min -> 4.5 rad/s)
+
+            # --- Tuning PID ---
+            stiffness=30.0,  # Kp - Sztywność.
+            damping=1.0,  # Kd - Tłumienie.
+        ),
+    },
+)

@@ -1,0 +1,477 @@
+# # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# # All rights reserved.
+# #
+# # SPDX-License-Identifier: BSD-3-Clause
+#
+# from __future__ import annotations
+#
+# import gymnasium as gym
+# import torch
+# import math
+# import isaaclab.sim as sim_utils
+# from isaaclab.assets import Articulation
+# from isaaclab.envs import DirectRLEnv
+# from isaaclab.terrains import TerrainImporter
+#
+# from .inzynierkaizaklaboratorium_env_cfg import InzynierkaizaklaboratoriumEnvCfg
+#
+#
+# class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+#     cfg: InzynierkaizaklaboratoriumEnvCfg
+#
+#     def __init__(self, cfg: InzynierkaizaklaboratoriumEnvCfg, render_mode: str | None = None, **kwargs):
+#         super().__init__(cfg, render_mode, **kwargs)
+#
+#         # Akcje - odchyłki od domyślnej pozycji serw (dla 10 serw)
+#         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+#         self._previous_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+#         self._prev_prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+#         # Komendy (joystick): [Prędkość liniowa X, Prędkość liniowa Y, Prędkość obrotowa Yaw]
+#         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+#
+#         # Słownik do logowania nagród w TensorBoard
+#         self._episode_sums = {
+#             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+#             for key in [
+#                 "alive_reward",
+#                 "termination_penalty",
+#                 "track_lin_vel_exp",
+#                 "track_yaw_vel_exp",
+#                 "lin_vel_z_penalty",
+#                 "ang_vel_xy_penalty",
+#                 "joint_vel_penalty",
+#             ]
+#         }
+#
+#     def _setup_scene(self):
+#         self._robot = Articulation(self.cfg.robot_cfg)
+#         self.scene.articulations["robot"] = self._robot
+#
+#         # Inicjalizacja terenu (Domain Randomization)
+#         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+#         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+#         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+#
+#         # Klonowanie środowisk (4096 robotów)
+#         self.scene.clone_environments(copy_from_source=False)
+#
+#         if self.device == "cpu":
+#             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+#
+#         # Oświetlenie sceny
+#         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+#         light_cfg.func("/World/Light", light_cfg)
+#
+#     def _pre_physics_step(self, actions: torch.Tensor):
+#         self._actions = actions.clone()
+#         # Sieć uczy się akcji w okolicach zera. Skalujemy je i dodajemy do pozycji domyślnej robota
+#         self._processed_actions = (self.cfg.action_scale * self._actions) + self._robot.data.default_joint_pos
+#
+#         # ORYGINALNE LOSOWANIE (WYKOMENTOWANE NA CZAS TESTÓW)
+#         # env_ids = (self.episode_length_buf % 150 == 0).nonzero(as_tuple=False).flatten()
+#         # if len(env_ids) > 0:
+#         #     self._commands[env_ids, 0] = torch.rand(len(env_ids), device=self.device) * 0.8 - 0.2  # Przód/Tył
+#         #     self._commands[env_ids, 1] = torch.rand(len(env_ids), device=self.device) * 0.2 - 0.1  # Na boki
+#         #     self._commands[env_ids, 2] = torch.rand(len(env_ids), device=self.device) * 1.0 - 0.5  # Obrót wokół własnej osi
+#
+#         # BRUTALNY HACK DO TRYBU PLAY: Wymuszamy stały marsz do przodu co klatkę!
+#         self._commands[:, 0] = 0.5  # lin_vel_x: Zawsze 0.5 m/s do przodu
+#         self._commands[:, 1] = 0.0  # lin_vel_y: Zero chodzenia bokiem
+#         self._commands[:, 2] = 0.0  # ang_vel_z: Zero obracania się
+#
+#     def _apply_action(self):
+#         raw_targets = (self.cfg.action_scale * self._actions) + self._robot.data.default_joint_pos
+#
+#         # Inicjalizacja zmiennej przy pierwszym uruchomieniu
+#         if not hasattr(self, "_current_targets"):
+#             self._current_targets = raw_targets.clone()
+#
+#         # FILTR DOLNOPRZEPUSTOWY: W danej klatce nakładamy tylko 80% nowej komendy.
+#         # 20% to "opóźnienie/bezwładność" z poprzedniej klatki.
+#         self._current_targets = 0.8 * raw_targets + 0.2 * self._current_targets
+#
+#         self._robot.set_joint_position_target(self._current_targets)
+#
+#     def _get_observations(self) -> dict:
+#         #self._previous_actions = self._actions.clone()
+#         self._prev_prev_actions = self._previous_actions.clone()
+#         self._previous_actions = self._actions.clone()
+#         # WIRTUALNY METRONOM (Central Pattern Generator - CPG)
+#         # Obliczamy fizyczny czas trwania obecnego epizodu dla każdego robota
+#         t = self.episode_length_buf * (self.cfg.sim.dt * self.cfg.decimation)
+#         self._phase = 2.0 * math.pi * self.cfg.gait_frequency * t  # ZAPISUJEMY DO self._phase!
+#         # Obliczamy fazę dla każdego środowiska
+#         #phase = 2.0 * math.pi * self.cfg.gait_frequency * t
+#
+#         # Wyciągamy wartości sin i cos (unsqueeze, żeby pasowały kształtem do wektora)
+#         phase_sin = torch.sin(self._phase).unsqueeze(-1)
+#         phase_cos = torch.cos(self._phase).unsqueeze(-1)
+#
+#         # Dokładnie 44 wymiary: 3+3+3+3+10+10+10 + 1 + 1
+#         obs = torch.cat(
+#             [
+#                 self._robot.data.root_lin_vel_b,  # Prędkość liniowa (3)
+#                 self._robot.data.root_ang_vel_b,  # Prędkość kątowa (3)
+#                 self._robot.data.projected_gravity_b,  # Wektor grawitacji (3)
+#                 self._commands,  # Joystick (3)
+#                 self._robot.data.joint_pos - self._robot.data.default_joint_pos,  # Odchyłka stawów (10)
+#                 self._robot.data.joint_vel,  # Prędkość stawów (10)
+#                 self._actions,  # Poprzednie akcje (10)
+#                 phase_sin,  # TIK-TAK: Sinus fazy chodu (1)
+#                 phase_cos,  # TIK-TAK: Cosinus fazy chodu (1)
+#             ],
+#             dim=-1,
+#         )
+#         return {"policy": obs}
+#
+#     def _get_rewards(self) -> torch.Tensor:
+#         # Obliczenia błędów śledzenia celu
+#         lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
+#         yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
+#         local_y_pos = self._robot.data.root_pos_w[:, 1] - self.scene.env_origins[:, 1]
+#         base_height_error = torch.square(self._robot.data.root_pos_w[:, 2] - self.cfg.base_height_target)
+#         dof_pos_error = torch.sum(torch.square(self._robot.data.joint_pos - self._robot.data.default_joint_pos), dim=1)
+#         action_rate_error = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
+#         if not hasattr(self, "stopa_l_idx"):
+#             self.stopa_l_idx = self._robot.data.body_names.index("stopaL_1")
+#             self.stopa_r_idx = self._robot.data.body_names.index("stopaR_1")
+#
+#             # 2. OBLICZENIE ODLEGŁOŚCI
+#         pos_l = self._robot.data.body_pos_w[:, self.stopa_l_idx, :]
+#         pos_r = self._robot.data.body_pos_w[:, self.stopa_r_idx, :]
+#         y_pos_penalty = torch.square(local_y_pos)
+#         # Mierzymy dystans między lewą a prawą stopą
+#         feet_dist = torch.norm(pos_l - pos_r, dim=-1)
+#         feet_dist_y = torch.abs(pos_l[:, 1] - pos_r[:, 1])
+#         # 3. WIRTUALNY METRONOM - OCENA RYTMU
+#         # Lewa noga w górę, gdy sinus > 0 (max 5 cm). Prawa, gdy sinus fazy przesuniętej o Pi > 0.
+#         left_foot_desired_z = torch.clamp(torch.sin(self._phase), min=0.0) * 0.05
+#         right_foot_desired_z = torch.clamp(torch.sin(self._phase + math.pi), min=0.0) * 0.05
+#
+#         left_foot_z = pos_l[:, 2] - self.scene.env_origins[:, 2]
+#         right_foot_z = pos_r[:, 2] - self.scene.env_origins[:, 2]
+#
+#         phase_error = torch.square(left_foot_z - left_foot_desired_z) + torch.square(
+#             right_foot_z - right_foot_desired_z)
+#
+#         # Jeśli odległość jest mniejsza niż 12cm (feet_min_distance), naliczamy karę.
+#         # clamp ucina wartości ujemne (czyli gdy stopy są szerzej niż 12cm, kara wynosi 0)
+#         #feet_dist_penalty = torch.clamp(self.cfg.feet_min_distance - feet_dist_y, min=0.0)
+#         # NOWE: Wykrywanie zbyt dużych sygnałów sterujących
+#         action_magnitude = torch.sum(torch.square(self._actions), dim=1)
+#         drift_penalty = torch.square(self._robot.data.root_lin_vel_b[:, 1])
+#         # OCHRONA SERW (Smoothness)
+#         action_smoothness_error = torch.sum(
+#             torch.square(self._actions - 2.0 * self._previous_actions + self._prev_prev_actions), dim=1)
+#
+#         # Komponenty nagród i kar
+#         rewards = {
+#             "alive_reward": self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float()),
+#             "termination_penalty": self.cfg.rew_scale_terminated * self.reset_terminated.float(),
+#             "track_lin_vel_exp": self.cfg.rew_scale_tracking_lin_vel * torch.exp(-lin_vel_error / 0.25),
+#             "track_yaw_vel_exp": self.cfg.rew_scale_tracking_yaw_vel * torch.exp(-yaw_rate_error / 0.25),
+#             "lin_vel_z_penalty": self.cfg.rew_scale_lin_vel_z * torch.square(self._robot.data.root_lin_vel_b[:, 2]),
+#             "ang_vel_xy_penalty": self.cfg.rew_scale_ang_vel_xy * torch.sum(
+#                 torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1),
+#             "joint_vel_penalty": self.cfg.rew_scale_joint_vel * torch.sum(torch.abs(self._robot.data.joint_vel), dim=1),
+#             "base_height_reward": self.cfg.rew_scale_base_height * torch.exp(-5.0 * base_height_error),
+#             "dof_pos_penalty": self.cfg.rew_scale_dof_pos * dof_pos_error,
+#             "action_rate_penalty": self.cfg.rew_scale_action_rate * action_rate_error,
+#             # NOWE: Dodanie kagańca do słownika
+#             "action_penalty": self.cfg.rew_scale_action_penalty * action_magnitude,
+#             #"feet_distance_penalty": feet_dist_penalty * self.cfg.rew_scale_feet_distance,
+#             "lin_vel_y_penalty": drift_penalty * self.cfg.rew_scale_lin_vel_y,
+#             "root_pos_y_penalty": y_pos_penalty * self.cfg.rew_scale_root_pos_y,
+#             # DODAJ TĘ LINIJKĘ: Właściwe karanie za obrót (Yaw)
+#             "ang_vel_z_penalty": self.cfg.rew_scale_ang_vel_z * torch.square(self._robot.data.root_ang_vel_b[:, 2]),
+#             # KARA ZA BRAK RYTMU:
+#             "phase_sync_penalty": phase_error * self.cfg.rew_scale_phase_sync,
+#             "action_smoothness_penalty": action_smoothness_error * self.cfg.rew_scale_action_smoothness,
+#         }
+#
+#         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+#
+#         for key, value in rewards.items():
+#             if key not in self._episode_sums:
+#                 self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+#             self._episode_sums[key] += value
+#
+#         return reward
+#
+#     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+#         base_height = self._robot.data.root_pos_w[:, 2]
+#         time_out = self.episode_length_buf >= self.max_episode_length - 1
+#         # Wykrycie upadku za pomocą wysokości (zamiast ContactSensora)
+#         died = base_height < self.cfg.base_height_fall
+#         return died, time_out
+#
+#     def _reset_idx(self, env_ids: torch.Tensor | None):
+#         if env_ids is None or len(env_ids) == self.num_envs:
+#             env_ids = self._robot._ALL_INDICES
+#
+#         self._robot.reset(env_ids)
+#         super()._reset_idx(env_ids)
+#
+#         if len(env_ids) == self.num_envs:
+#             # Rozproszenie momentów resetu, żeby uniknąć lagów przy masowym upadku
+#             self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+#
+#         self._actions[env_ids] = 0.0
+#         self._previous_actions[env_ids] = 0.0
+#         self._prev_prev_actions[env_ids] = 0.0
+#         self._commands[env_ids] = 0.0  # Zerowanie wektora komend przed nowym losowaniem
+#
+#         # DODAJEMY ZEROWANIE HISTORII I FILTRU OPÓŹNIEŃ PO UPADKU:
+#         if hasattr(self, "_current_targets"):
+#             self._current_targets[env_ids] = self._robot.data.default_joint_pos[env_ids].clone()
+#         # Reset stanu robota do domyślnego zrzutu
+#         joint_pos = self._robot.data.default_joint_pos[env_ids]
+#         joint_vel = self._robot.data.default_joint_vel[env_ids]
+#         default_root_state = self._robot.data.default_root_state[env_ids]
+#         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+#         default_root_state[:, 2] = self.cfg.base_height_target
+#
+#         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+#         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+#         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+#
+#         # Logowanie do TensorBoarda (wypychanie zebranych danych po restarcie epizodu)
+#         extras = dict()
+#         for key in self._episode_sums.keys():
+#             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+#             extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+#             self._episode_sums[key][env_ids] = 0.0
+#
+#         self.extras["log"] = dict()
+#         self.extras["log"].update(extras)
+#         self.extras["log"]["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import gymnasium as gym
+import torch
+import math
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectRLEnv
+from isaaclab.terrains import TerrainImporter
+
+from .inzynierkaizaklaboratorium_env_cfg import InzynierkaizaklaboratoriumEnvCfg
+
+
+class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+    cfg: InzynierkaizaklaboratoriumEnvCfg
+
+    def __init__(self, cfg: InzynierkaizaklaboratoriumEnvCfg, render_mode: str | None = None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
+
+        # Akcje - odchyłki od domyślnej pozycji serw (dla 10 serw)
+        self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._previous_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._prev_prev_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+
+        # Komendy (joystick): [Prędkość liniowa X, Prędkość liniowa Y, Prędkość obrotowa Yaw]
+        self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # Słownik do logowania nagród w TensorBoard (Dodano orientation_penalty)
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "alive_reward",
+                "termination_penalty",
+                "track_lin_vel_exp",
+                "track_yaw_vel_exp",
+                "lin_vel_z_penalty",
+                "ang_vel_xy_penalty",
+                "joint_vel_penalty",
+                "orientation_penalty",
+            ]
+        }
+
+    def _setup_scene(self):
+        self._robot = Articulation(self.cfg.robot_cfg)
+        self.scene.articulations["robot"] = self._robot
+
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+
+        self.scene.clone_environments(copy_from_source=False)
+
+        if self.device == "cpu":
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    def _pre_physics_step(self, actions: torch.Tensor):
+        # 1. NAPRAWA HISTORII: Przesuwamy bufory ZANIM nadpiszemy self._actions
+        self._prev_prev_actions = self._previous_actions.clone()
+        self._previous_actions = self._actions.clone()
+
+        # 2. Zapisujemy nową akcję
+        self._actions = actions.clone()
+        self._processed_actions = (self.cfg.action_scale * self._actions) + self._robot.data.default_joint_pos
+
+        # 3. TRENING WIELOBIEGOWY: Co 150 klatek robot losuje nową prędkość do przodu (0.0 do 0.4 m/s)
+        # Dzięki temu uczy się i stać w miejscu, i płynnie maszerować.
+        env_ids = (self.episode_length_buf % 150 == 0).nonzero(as_tuple=False).flatten()
+        if len(env_ids) > 0:
+            self._commands[env_ids, 0] = torch.rand(len(env_ids), device=self.device) * 0.4  # Od zera do 0.4 m/s
+            self._commands[env_ids, 1] = 0.0  # Zero driftu
+            self._commands[env_ids, 2] = 0.0  # Zero obracania się
+
+    def _apply_action(self):
+        raw_targets = (self.cfg.action_scale * self._actions) + self._robot.data.default_joint_pos
+
+        if not hasattr(self, "_current_targets"):
+            self._current_targets = raw_targets.clone()
+
+        # FILTR DOLNOPRZEPUSTOWY: Opóźnienie / ochrona przed prądowym uderzeniem w serwa
+        self._current_targets = 0.8 * raw_targets + 0.2 * self._current_targets
+        self._robot.set_joint_position_target(self._current_targets)
+
+    def _get_observations(self) -> dict:
+        t = self.episode_length_buf * (self.cfg.sim.dt * self.cfg.decimation)
+        self._phase = 2.0 * math.pi * self.cfg.gait_frequency * t
+
+        phase_sin = torch.sin(self._phase).unsqueeze(-1)
+        phase_cos = torch.cos(self._phase).unsqueeze(-1)
+
+        obs = torch.cat(
+            [
+                self._robot.data.root_lin_vel_b,
+                self._robot.data.root_ang_vel_b,
+                self._robot.data.projected_gravity_b,
+                self._commands,
+                self._robot.data.joint_pos - self._robot.data.default_joint_pos,
+                self._robot.data.joint_vel,
+                self._actions,
+                phase_sin,
+                phase_cos,
+            ],
+            dim=-1,
+        )
+        return {"policy": obs}
+
+    def _get_rewards(self) -> torch.Tensor:
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
+        yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
+        local_y_pos = self._robot.data.root_pos_w[:, 1] - self.scene.env_origins[:, 1]
+        base_height_error = torch.square(self._robot.data.root_pos_w[:, 2] - self.cfg.base_height_target)
+        dof_pos_error = torch.sum(torch.square(self._robot.data.joint_pos - self._robot.data.default_joint_pos), dim=1)
+
+        action_rate_error = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
+        action_magnitude = torch.sum(torch.square(self._actions), dim=1)
+        action_smoothness_error = torch.sum(
+            torch.square(self._actions - 2.0 * self._previous_actions + self._prev_prev_actions), dim=1)
+
+        # ZMUSZAMY GO DO PIONOWEJ POSTAWY (Wektor grawitacji musi celować idealnie w podłogę, bez odchyleń X/Y)
+        orientation_error = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1)
+
+        if not hasattr(self, "stopa_l_idx"):
+            self.stopa_l_idx = self._robot.data.body_names.index("stopaL_1")
+            self.stopa_r_idx = self._robot.data.body_names.index("stopaR_1")
+
+        pos_l = self._robot.data.body_pos_w[:, self.stopa_l_idx, :]
+        pos_r = self._robot.data.body_pos_w[:, self.stopa_r_idx, :]
+
+        y_pos_penalty = torch.square(local_y_pos)
+        drift_penalty = torch.square(self._robot.data.root_lin_vel_b[:, 1])
+
+        # WIRTUALNY METRONOM
+        left_foot_desired_z = torch.clamp(torch.sin(self._phase), min=0.0) * 0.05
+        right_foot_desired_z = torch.clamp(torch.sin(self._phase + math.pi), min=0.0) * 0.05
+
+        left_foot_z = pos_l[:, 2] - self.scene.env_origins[:, 2]
+        right_foot_z = pos_r[:, 2] - self.scene.env_origins[:, 2]
+
+        phase_error = torch.square(left_foot_z - left_foot_desired_z) + torch.square(
+            right_foot_z - right_foot_desired_z)
+
+        rewards = {
+            "alive_reward": self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float()),
+            "termination_penalty": self.cfg.rew_scale_terminated * self.reset_terminated.float(),
+
+            "track_lin_vel_exp": self.cfg.rew_scale_tracking_lin_vel * torch.exp(-lin_vel_error / 0.05),
+            "track_yaw_vel_exp": self.cfg.rew_scale_tracking_yaw_vel * torch.exp(-yaw_rate_error / 0.05),
+
+            "lin_vel_z_penalty": self.cfg.rew_scale_lin_vel_z * torch.square(self._robot.data.root_lin_vel_b[:, 2]),
+            "ang_vel_xy_penalty": self.cfg.rew_scale_ang_vel_xy * torch.sum(
+                torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1),
+            "joint_vel_penalty": self.cfg.rew_scale_joint_vel * torch.sum(torch.abs(self._robot.data.joint_vel), dim=1),
+            "base_height_reward": self.cfg.rew_scale_base_height * torch.exp(-5.0 * base_height_error),
+            "dof_pos_penalty": self.cfg.rew_scale_dof_pos * dof_pos_error,
+            "action_rate_penalty": self.cfg.rew_scale_action_rate * action_rate_error,
+            "action_penalty": self.cfg.rew_scale_action_penalty * action_magnitude,
+            "lin_vel_y_penalty": drift_penalty * self.cfg.rew_scale_lin_vel_y,
+            "root_pos_y_penalty": y_pos_penalty * self.cfg.rew_scale_root_pos_y,
+            "ang_vel_z_penalty": self.cfg.rew_scale_ang_vel_z * torch.square(self._robot.data.root_ang_vel_b[:, 2]),
+            "phase_sync_penalty": phase_error * self.cfg.rew_scale_phase_sync,
+            "action_smoothness_penalty": action_smoothness_error * self.cfg.rew_scale_action_smoothness,
+
+            # DODANA KARA ZA ZOMBI-POSTAWĘ
+            "orientation_penalty": orientation_error * self.cfg.rew_scale_orientation,
+        }
+
+        reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
+
+        for key, value in rewards.items():
+            if key not in self._episode_sums:
+                self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums[key] += value
+
+        return reward
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        base_height = self._robot.data.root_pos_w[:, 2]
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        died = base_height < self.cfg.base_height_fall
+        return died, time_out
+
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+
+        self._robot.reset(env_ids)
+        super()._reset_idx(env_ids)
+
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
+
+        self._actions[env_ids] = 0.0
+        self._previous_actions[env_ids] = 0.0
+        self._prev_prev_actions[env_ids] = 0.0
+        self._commands[env_ids] = 0.0
+
+        if hasattr(self, "_current_targets"):
+            self._current_targets[env_ids] = self._robot.data.default_joint_pos[env_ids].clone()
+
+        joint_pos = self._robot.data.default_joint_pos[env_ids]
+        joint_vel = self._robot.data.default_joint_vel[env_ids]
+        default_root_state = self._robot.data.default_root_state[env_ids]
+        default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        default_root_state[:, 2] = self.cfg.base_height_target
+
+        self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        extras = dict()
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            self._episode_sums[key][env_ids] = 0.0
+
+        self.extras["log"] = dict()
+        self.extras["log"].update(extras)
+        self.extras["log"]["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()

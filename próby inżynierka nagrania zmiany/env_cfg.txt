@@ -1,0 +1,140 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+import isaaclab.envs.mdp as mdp
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
+
+from isaaclab_assets.robots.inzynierka import PORZADKI_ROBOT_CFG
+
+
+@configclass
+class EventCfg:
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (1.0, 1.0),
+            "dynamic_friction_range": (0.8, 0.8),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "mass_distribution_params": (0.0, 0.0),
+            "operation": "add",
+        },
+    )
+
+
+@configclass
+class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+    episode_length_s = 10.0
+    decimation = 4
+    action_scale = 0.25
+    action_space = 10
+
+    observation_space = 44
+    state_space = 0
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 120,
+        render_interval=decimation,
+        gravity=(0.0, 0.0, -9.81),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.0, replicate_physics=True)
+    events: EventCfg = EventCfg()
+    robot_cfg: ArticulationCfg = PORZADKI_ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+
+    # --- PARAMETRY LOKOMOCJI (FILOZOFIA MARCHEWKI) ---
+    # --- PARAMETRY LOKOMOCJI (LEKARSTWO NA RAKA) ---
+    base_height_target = 0.270
+    base_height_fall = 0.15
+    gait_frequency = 1.2
+
+    # # 1. Przetrwanie
+    # rew_scale_alive = 0.0
+    # rew_scale_terminated = -200.0  # Karzemy za upadek
+    #
+    # # 2. Główny cel: Idź w przód (+X)
+    # rew_scale_track_lin_vel_x_exp = 0
+    # rew_scale_forward_progress = 0
+    # rew_scale_track_lin_vel_y_exp = 0.0
+    # rew_scale_track_lin_vel_exp = 0.0
+    # rew_scale_track_yaw_vel_exp = 0.0  # <--- TEJ LINIJKI BRAKOWAŁO U CIEBIE
+    # # 3. BARIERY BOCZNE (Lekarstwo na "Chód Raka")
+    # rew_scale_lin_vel_y_penalty = -25.0  # GIGANTYCZNA kara za uciekanie bokiem
+    # rew_scale_ang_vel_z_penalty = -25.0  # Kara za kręcenie miednicą w kółko
+    #
+    # # 4. Postawa i Rytmika
+    # rew_scale_base_height = 4.0
+    # rew_scale_phase_sync = 5.0
+    # rew_scale_orientation = -15.0
+    #
+    # # 5. Ochrona serw i zwalczanie wibracji
+    # rew_scale_action_rate = -0.05
+    # rew_scale_action_smoothness = -0.10
+    # rew_scale_action_penalty = -0.005
+    # rew_scale_joint_vel = -0.02
+    # rew_scale_feet_stance = -15.0  # Potężny bat za krzyżowanie nóg
+    # 1. Przetrwanie
+    rew_scale_alive = 0.01
+    rew_scale_terminated = -20.0
+
+    # 2. Brak translacji
+    rew_scale_track_lin_vel_x_exp = 20.0
+    rew_scale_forward_progress = 10.0
+
+    rew_scale_track_lin_vel_y_exp = 1.0
+    rew_scale_track_lin_vel_exp = 0.0
+    rew_scale_track_yaw_vel_exp = 1.0
+
+    # 3. Nie uciekaj bokiem / nie obracaj się
+    rew_scale_lin_vel_y_penalty = -3.0
+    rew_scale_ang_vel_z_penalty = -4.0
+
+    # 4. Stój pionowo na odpowiedniej wysokości
+    rew_scale_base_height = 0.5
+    rew_scale_phase_sync = 2.3
+    rew_scale_orientation = -8.0
+
+    # 5. Nie machaj niepotrzebnie serwami
+    rew_scale_action_rate = -0.01
+    rew_scale_action_smoothness = -0.02
+    rew_scale_action_penalty = -0.001
+    rew_scale_joint_vel = -0.005
+    rew_scale_feet_stance = -5.0

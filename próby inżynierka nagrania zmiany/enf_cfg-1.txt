@@ -1,0 +1,271 @@
+# import isaaclab.envs.mdp as mdp
+# import isaaclab.sim as sim_utils
+# from isaaclab.assets import ArticulationCfg
+# from isaaclab.envs import DirectRLEnvCfg
+# from isaaclab.managers import EventTermCfg as EventTerm
+# from isaaclab.managers import SceneEntityCfg
+# from isaaclab.scene import InteractiveSceneCfg
+# from isaaclab.sim import SimulationCfg
+# from isaaclab.terrains import TerrainImporterCfg
+# from isaaclab.utils import configclass
+#
+# # IMPORT TWOJEGO ROBOTA Z FOLDERU ROBOTS
+# from isaaclab_assets.robots.inzynierka import PORZADKI_ROBOT_CFG
+#
+#
+# @configclass
+# class EventCfg:
+#     """Losowanie warunków (Domain Randomization) - niezbędne do Sim-to-Real"""
+#     physics_material = EventTerm(
+#         func=mdp.randomize_rigid_body_material,
+#         mode="startup",
+#         params={
+#             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+#             "static_friction_range": (0.6, 1.2),
+#             "dynamic_friction_range": (0.4, 1.0),
+#             "restitution_range": (0.0, 0.0),
+#             "num_buckets": 64,
+#         },
+#     )
+#     add_base_mass = EventTerm(
+#         func=mdp.randomize_rigid_body_mass,
+#         mode="startup",
+#         params={
+#             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+#             "mass_distribution_params": (-0.2, 0.5),  # Losowo ujmuje 200g lub dodaje do 500g do bazy
+#             "operation": "add",
+#         },
+#     )
+#
+#
+# @configclass
+# class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+#     # env
+#     episode_length_s = 30.0
+#     decimation = 4
+#     action_scale = 0.5
+#     action_space = 10
+#
+#     # OBSERWACJE (43):
+#     # Lin_vel(3) + Ang_vel(3) + Quat(4) + JointPos(10) + JointVel(10) + PrevActions(10) + Commands(3)
+#     observation_space = 44
+#     state_space = 0
+#
+#     # simulation
+#     sim: SimulationCfg = SimulationCfg(
+#         dt=1 / 120,
+#         render_interval=decimation,
+#         gravity=(0.0, 0.0, -9.81),  # <--- TWARDE ZIEMSKIE PRZYCIĄGANIE (Oś Z)
+#         physics_material=sim_utils.RigidBodyMaterialCfg(
+#             friction_combine_mode="multiply",
+#             restitution_combine_mode="multiply",
+#             static_friction=1.0,
+#             dynamic_friction=1.0,
+#             restitution=0.0,
+#         ),
+#     )
+#
+#     terrain = TerrainImporterCfg(
+#         prim_path="/World/ground",
+#         terrain_type="plane",
+#         collision_group=-1,
+#         physics_material=sim_utils.RigidBodyMaterialCfg(
+#             friction_combine_mode="multiply",
+#             restitution_combine_mode="multiply",
+#             static_friction=1.0,
+#             dynamic_friction=1.0,
+#             restitution=0.0,
+#         ),
+#     )
+#
+#     # scene
+#     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.0, replicate_physics=True)
+#
+#     # events
+#     events: EventCfg = EventCfg()
+#
+#     # robot
+#     robot_cfg: ArticulationCfg = PORZADKI_ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+#
+#     # CUSTOM PARAMETERS & REWARDS DLA LOKOMOCJI
+#     base_height_target = 0.250
+#     base_height_fall = 0.09
+#     gait_frequency = 1.5  # <--- TUTAJ TO DODAJESZ (wymusza 1.5 pełnego cyklu na sekundę)
+#
+#     # # Skale nagród (wzorowane na lokomocji kierunkowej)
+#     # rew_scale_alive = 0.0  # Za nieprzewrócenie się
+#     # rew_scale_terminated = -10.0  # Gleba = twardy reset
+#     # rew_scale_tracking_lin_vel = 30.0  # Nagroda za marsz do przodu (zgodnie z komendą)
+#     # rew_scale_tracking_yaw_vel = 0.0  # Nagroda za obracanie się w zadanym kierunku
+#     # rew_scale_lin_vel_z = -4.0  # Kara za podskakiwanie jak żaba (chcemy płaski chód)
+#     # rew_scale_ang_vel_xy = -0.5  # Kara za kiwanie się na boki
+#     # rew_scale_joint_vel = -0.01  # Kara za szarpanie serwami
+#     # rew_scale_base_height = 2.0  # Nagroda za trzymanie bazy na 28.2 cm
+#     # rew_scale_dof_pos = -0.5  # Delikatna kara za zbytnie odchylanie się od pozycji wyprostowanej
+#     # rew_scale_action_rate = -0.05  # Surowa kara za drganie serwami
+#     # rew_scale_action_penalty = -0.01  # KAGANIEC: Kara za wysyłanie gigantycznych wartości do regulatora
+#     # # WIRTUALNY KLOCEK MIĘDZY NOGAMI
+#     # feet_min_distance = 0.22  # Wymagamy minimum 12 cm rozstawu stóp
+#     # rew_scale_feet_distance = -50.0  # Mordercza kara za "chód linoskoczka"
+#     # # Kara za znoszenie na boki (drift w osi Y)
+#     # rew_scale_lin_vel_y = -3.0
+#     # # Kara za fizyczne schodzenie ze ścieżki (wideo MATLAB: -3y^2)
+#     # rew_scale_root_pos_y = -3.0
+#     # # DODAJ TO: Mordercza kara za obracanie się wokół własnej osi!
+#     # rew_scale_ang_vel_z = -5.0
+#     # # Nagroda za trzymanie kroku z metronomem
+#     # rew_scale_phase_sync = -0.2
+#     # # Mordercza kara za "szarpanie" sygnałem (chroni silniki przed spaleniem)
+#     # rew_scale_action_smoothness = -0.01
+#     # OPTYMALNE SKALE NAGRÓD (Zbalansowane, aby zapobiec zastyganiu)
+#     rew_scale_alive = 0.5  # Mała nagroda za przeżycie
+#     rew_scale_terminated = -10.0  # Twardy reset
+#
+#     # GŁÓWNY MOTOR NAPĘDOWY: Potężna nagroda za ruch do przodu
+#     rew_scale_tracking_lin_vel = 50.0  # Było 30.0. Teraz pragnienie ruchu pokonuje strach przed karami!
+#
+#     # Blokada kręcenia się w kółko (które miałeś wcześniej)
+#     rew_scale_ang_vel_z = -5.0
+#     rew_scale_root_pos_y = -3.0  # Niepozwala znosić go na boki
+#
+#     # Zbliżamy się do Imitation Learning (Trzymaj postawę!)
+#     # Mocna kara za wykręcanie serw z ich początkowego (wyprostowanego) stanu:
+#     rew_scale_dof_pos = -2.0
+#
+#     # ŁAGODNE kary dla serw (tylko żeby ich nie spalić, ale bez wywoływania paraliżu)
+#     rew_scale_action_rate = -0.01
+#     rew_scale_action_smoothness = -0.01
+#
+#     # WYWALAMY WIRTUALNY KLOCEK:
+#     # rew_scale_feet_distance = 0.0 (Usuń tę linijkę, to ona spowodowała ten szpagat na zdjęciu!)
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import isaaclab.envs.mdp as mdp
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
+
+# IMPORT TWOJEGO ROBOTA Z FOLDERU ROBOTS
+from isaaclab_assets.robots.inzynierka import PORZADKI_ROBOT_CFG
+
+
+@configclass
+class EventCfg:
+    """Losowanie warunków (Domain Randomization) - niezbędne do Sim-to-Real"""
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.6, 1.2),
+            "dynamic_friction_range": (0.4, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "mass_distribution_params": (-0.2, 0.5),  # Losowo ujmuje 200g lub dodaje do 500g do bazy
+            "operation": "add",
+        },
+    )
+
+
+@configclass
+class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+    # env
+    episode_length_s = 30.0
+    decimation = 4
+    action_scale = 0.5
+    action_space = 10
+
+    # OBSERWACJE (44):
+    # Lin_vel(3) + Ang_vel(3) + Quat(4) + JointPos(10) + JointVel(10) + PrevActions(10) + Commands(3) + PhaseSin(1) + PhaseCos(1)
+    observation_space = 44
+    state_space = 0
+
+    # simulation
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 120,
+        render_interval=decimation,
+        gravity=(0.0, 0.0, -9.81),  # TWARDE ZIEMSKIE PRZYCIĄGANIE
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    # scene
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.0, replicate_physics=True)
+
+    # events
+    events: EventCfg = EventCfg()
+
+    # robot
+    robot_cfg: ArticulationCfg = PORZADKI_ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+
+    # CUSTOM PARAMETERS & REWARDS DLA LOKOMOCJI
+    base_height_target = 0.250
+    base_height_fall = 0.09
+    gait_frequency = 1.2  # ZWOLNIONY METRONOM (spokojniejszy, pewniejszy krok)
+
+    # --- ZBALANSOWANE SKALE NAGRÓD ---
+
+    # 1. Przetrwanie i pęd do przodu
+    rew_scale_alive = 0.05
+    rew_scale_tracking_lin_vel = 5.0
+    rew_scale_tracking_yaw_vel = 0.0
+    rew_scale_base_height = 0.2
+
+    # 2. Blokady głupich ruchów tułowia (Kaganiec)
+    rew_scale_terminated = -1.0
+    rew_scale_lin_vel_z = -0.4
+    rew_scale_ang_vel_xy = -0.05
+    rew_scale_ang_vel_z = -1.0  # PODBITE: Kategoryczny zakaz kręcenia się w kółko
+    rew_scale_lin_vel_y = -0.3
+    rew_scale_root_pos_y = -1.0  # PODBITE: Niewidzialna ściana, ma iść idealnie prosto
+    rew_scale_orientation = -1.0  # NOWE: Bat na odchylanie głowy do tyłu (prostuje postawę)
+
+    # 3. Kary za stawy (Ochrona sprzętu)
+    rew_scale_dof_pos = -0.2
+    rew_scale_joint_vel = -0.001
+    rew_scale_action_penalty = -0.001
+    rew_scale_action_rate = -0.001
+    rew_scale_action_smoothness = -0.001
+
+    # 4. Metronom chodu
+    rew_scale_phase_sync = -0.2
+    rew_scale_phase_sync = -0.2
