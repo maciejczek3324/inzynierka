@@ -243,6 +243,25 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
                 "stand_lin_vel",
                 "stand_yaw_vel",
+                "stand_upright",
+                "stand_tilt_debug",
+                "stand_action",
+                "stand_double_contact_debug",
+                "stand_single_support_debug",
+                "stand_single_support",
+                "stand_knee_sym",
+                "stand_knee_sym_debug",
+
+                "stand_obrot9_debug",
+                "stand_obrot10_debug",
+                "stand_obrot9_abs_debug",
+                "stand_obrot10_abs_debug",
+                "stand_obrot10",
+                "stand_ankle_sym",
+                "stand_obrot9_extra",
+                # "stand_obrot9_abs_debug",
+                # "stand_obrot10_abs_debug",
+                "stand_ankle_sym_debug",
             ]
         }
 
@@ -568,8 +587,21 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         # Aktywne wyłącznie dla zerowej komendy.
         # ============================================================
 
+        stand_pose_excess = torch.clamp(
+            torch.abs(joint_delta_all) - 0.10,
+            min=0.0,
+        )
+
         stand_pose_error = torch.mean(
-            torch.square(joint_delta_all),
+            torch.square(stand_pose_excess),
+            dim=1,
+        )
+        stand_tilt_error = torch.sum(
+            torch.square(self._robot.data.projected_gravity_b[:, :2]),
+            dim=1,
+        )
+        stand_action_error = torch.mean(
+            torch.square(self._actions),
             dim=1,
         )
 
@@ -838,6 +870,33 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         default_knee_r = self._robot.data.default_joint_pos[:, self.knee_r_idx]
         left_knee_delta = knee_l - default_knee_l
         right_knee_delta = knee_r - default_knee_r
+
+        # ============================================================
+        # SYMETRIA KOLAN PODCZAS STANIA
+        #
+        # Kierunki zgięcia kolan są przeciwne:
+        # lewe  -> dodatni delta
+        # prawe -> ujemny delta
+        # dlatego dla porównania odwracamy znak prawego.
+        # ============================================================
+
+        stand_left_knee_flex = left_knee_delta
+        stand_right_knee_flex = -right_knee_delta
+
+        stand_knee_sym_diff = torch.abs(
+            stand_left_knee_flex - stand_right_knee_flex
+        )
+
+        # Małe różnice są dozwolone, żeby robot mógł balansować.
+        stand_knee_sym_excess = torch.clamp(
+            stand_knee_sym_diff - self.cfg.stand_knee_sym_deadband,
+            min=0.0,
+        )
+
+        stand_knee_sym_error = torch.square(
+            stand_knee_sym_excess
+        )
+
         left_knee_flex = torch.clamp(
             left_knee_delta,
             min=0.0,
@@ -847,6 +906,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             -right_knee_delta,
             min=0.0,
         )
+
         # DODATKOWE zgięcie względem crouch neutral.
         #
         # LEWE:
@@ -997,6 +1057,10 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         double_support = left_contact & right_contact
 
         stand_double_contact = double_support.float()
+
+        stand_single_support = (
+                left_contact ^ right_contact
+        ).float()
         # ============================================================
         # PRZEDŁUŻONY DOUBLE SUPPORT
         #
@@ -1577,6 +1641,45 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         #     min=0.0,
         # )
         yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
+
+        # obrot10_idx = self.debug_joint_indices["obrot10"]
+        #
+        # stand_obrot10_delta = joint_delta_all[:, obrot10_idx]
+        #
+        # stand_obrot10_excess = torch.clamp(
+        #     torch.abs(stand_obrot10_delta) - 0.10,
+        #     min=0.0,
+        # )
+        #
+        # stand_obrot10_error = torch.square(
+        #     stand_obrot10_excess
+        # )
+
+        obrot9_idx = self.debug_joint_indices["obrot9"]
+        obrot10_idx = self.debug_joint_indices["obrot10"]
+
+        obrot9_delta = joint_delta_all[:, obrot9_idx]
+        obrot10_delta = joint_delta_all[:, obrot10_idx]
+
+        obrot9_abs = torch.abs(obrot9_delta)
+        obrot10_abs = torch.abs(obrot10_delta)
+
+        # Kara za brak symetrii obu "bliźniaczych" stawów podczas stania.
+        stand_ankle_sym_error = torch.square(
+            torch.clamp(
+                torch.abs(obrot9_abs - obrot10_abs) - self.cfg.stand_ankle_sym_deadband,
+                min=0.0,
+            )
+        )
+
+        # Dodatkowa kara tylko wtedy, gdy obrot9 jest bardziej zagięty niż obrot10.
+        # stand_obrot9_extra_error = torch.square(
+        #     torch.clamp(
+        #         obrot9_abs - obrot10_abs - 0.01,
+        #         min=0.0,
+        #     )
+        # )
+
         rewards = {
             "alive": (
                 self.cfg.rew_scale_alive
@@ -1754,6 +1857,49 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     * stand_gate
                     * self.step_dt
             ),
+            "stand_upright": (
+                    self.cfg.rew_scale_stand_upright
+                    * stand_tilt_error
+                    * stand_gate
+                    * self.step_dt
+            ),
+            "stand_action": (
+                    self.cfg.rew_scale_stand_action
+                    * stand_action_error
+                    * stand_gate
+                    * self.step_dt
+            ),
+            "stand_single_support": (
+                    self.cfg.rew_scale_stand_single_support
+                    * stand_single_support
+                    * stand_gate
+                    * self.step_dt
+            ),
+            "stand_knee_sym": (
+                    self.cfg.rew_scale_stand_knee_sym
+                    * stand_knee_sym_error
+                    * stand_gate
+                    * self.step_dt
+            ),
+            # "stand_obrot10": (
+            #         self.cfg.rew_scale_stand_obrot10
+            #         * stand_obrot10_error
+            #         * stand_gate
+            #         * self.step_dt
+            # ),
+            "stand_ankle_sym": (
+                    self.cfg.rew_scale_stand_ankle_sym
+                    * stand_ankle_sym_error
+                    * stand_gate
+                    * self.step_dt
+            ),
+
+            # "stand_obrot9_extra": (
+            #         self.cfg.rew_scale_stand_obrot9_extra
+            #         * stand_obrot9_extra_error
+            #         * stand_gate
+            #         * self.step_dt
+            # ),
 
         }
 
@@ -1929,6 +2075,60 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 )
                 * stand_gate
                 * self.step_dt
+        )
+        self._episode_sums["stand_tilt_debug"] += (
+                stand_tilt_error
+                * stand_gate
+                * self.step_dt
+        )
+        self._episode_sums["stand_double_contact_debug"] += (
+                stand_double_contact
+                * stand_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["stand_single_support_debug"] += (
+                stand_single_support
+                * stand_gate
+                * self.step_dt
+        )
+        self._episode_sums["stand_knee_sym_debug"] += (
+                stand_knee_sym_diff
+                * stand_gate
+                * self.step_dt
+        )
+        # self._episode_sums["stand_obrot9_debug"] += (
+        #         joint_delta_all[:, self.debug_joint_indices["obrot9"]]
+        #         * stand_gate
+        #         * self.step_dt
+        # )
+        #
+        # self._episode_sums["stand_obrot10_debug"] += (
+        #         joint_delta_all[:, self.debug_joint_indices["obrot10"]]
+        #         * stand_gate
+        #         * self.step_dt
+        # )
+        self._episode_sums["stand_obrot9_abs_debug"] += (
+                torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot9"]])
+                * stand_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["stand_obrot10_abs_debug"] += (
+                torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot10"]])
+                * stand_gate
+                * self.step_dt
+        )
+        self._episode_sums["stand_obrot9_abs_debug"] += (
+                obrot9_abs * stand_gate * self.step_dt
+        )
+
+        self._episode_sums["stand_obrot10_abs_debug"] += (
+                obrot10_abs * stand_gate * self.step_dt
+        )
+
+        self._episode_sums["stand_ankle_sym_debug"] += (
+                torch.abs(obrot9_abs - obrot10_abs) * stand_gate * self.step_dt
         )
         return reward
 

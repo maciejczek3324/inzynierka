@@ -129,7 +129,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
 
     # 15% wylosowanych komend = stanie w miejscu.
     standing_command_probability = 0.25
-    command_resample_time_s = 2.5
+    command_resample_time_s = 10
 
     # Gotowe zakresy na późniejszy etap omnidirectional.
     omni_min_speed = 0.08
@@ -218,10 +218,45 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     stand_pose_sigma = 0.025
     stand_height_sigma = 0.025
 
-    rew_scale_stand_pose = -6.0
-    rew_scale_stand_height = 2.0
-    rew_scale_stand_joint_vel = -0.5
-    rew_scale_stand_double_contact = 1.0
+    rew_scale_stand_pose = 0.0
+    rew_scale_stand_height = 0.0
+    rew_scale_stand_joint_vel = 0.0
+    rew_scale_stand_double_contact = 2.0
 
-    rew_scale_stand_lin_vel = -8.0
-    rew_scale_stand_yaw_vel = -3.0
+    rew_scale_stand_lin_vel = -10.0
+    rew_scale_stand_yaw_vel = -4.0
+    rew_scale_stand_upright = -10.0
+    rew_scale_stand_action = 0.0
+    # CHCEMY DWIE STOPY NA ZIEMI.
+    rew_scale_stand_single_support = -2.0
+    # --- STANDING ---
+
+    # stand_height_sigma = 0.025
+    #
+    # rew_scale_stand_pose = 0.0
+    # rew_scale_stand_height = 0.0
+    #
+    # # Może aktywnie pracować nogami żeby nie upaść.
+    # rew_scale_stand_joint_vel = 0.0
+    # rew_scale_stand_action = 0.0
+    #
+    # # Dwie stopy mają być na ziemi.
+    # rew_scale_stand_double_contact = 2.0
+    # rew_scale_stand_single_support = -2.0
+    #
+    # # Nie odjeżdżaj i nie obracaj się.
+    # rew_scale_stand_lin_vel = -10.0
+    # rew_scale_stand_yaw_vel = -4.0
+    #
+    # # Baza pionowo.
+    # rew_scale_stand_upright = -10.0
+
+    # Obie nogi mają mieć podobne zgięcie kolana.
+    stand_knee_sym_deadband = 0.08
+    rew_scale_stand_knee_sym = -6.0
+    # rew_scale_stand_obrot10 = -8.0
+
+    stand_ankle_sym_deadband = 0.02
+
+    rew_scale_stand_ankle_sym = -8.0
+    # rew_scale_stand_obrot9_extra = -10.0
