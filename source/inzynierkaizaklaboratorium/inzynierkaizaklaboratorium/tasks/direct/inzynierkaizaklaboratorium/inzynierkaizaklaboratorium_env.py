@@ -262,6 +262,9 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 # "stand_obrot9_abs_debug",
                 # "stand_obrot10_abs_debug",
                 "stand_ankle_sym_debug",
+                "stand_foot_flat",
+                "stand_left_foot_tilt_deg_debug",
+                "stand_right_foot_tilt_deg_debug",
             ]
         }
 
@@ -807,7 +810,74 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         pos_r = self._robot.data.body_pos_w[
             :, self.stopa_r_idx, :
         ]
+        # ============================================================
+        # PŁASKOŚĆ STÓP PODCZAS STANIA
+        #
+        # Zakładamy, że lokalna oś Z bryły stopy jest normalną
+        # do podeszwy.
+        #
+        # Dla płaskiej stopy lokalne Z po obrocie powinno być
+        # równoległe do światowego Z.
+        # ============================================================
 
+        quat_l = self._robot.data.body_quat_w[:, self.stopa_l_idx, :]
+        quat_r = self._robot.data.body_quat_w[:, self.stopa_r_idx, :]
+
+        # Isaac Lab: quaternion = [w, x, y, z]
+        wl, xl, yl, zl = quat_l.unbind(dim=1)
+        wr, xr, yr, zr = quat_r.unbind(dim=1)
+
+        # Składowa Z lokalnej osi Z stopy po obrocie do świata.
+        left_foot_normal_z = (
+                1.0 - 2.0 * (xl * xl + yl * yl)
+        )
+
+        right_foot_normal_z = (
+                1.0 - 2.0 * (xr * xr + yr * yr)
+        )
+
+        left_foot_normal_z = torch.clamp(
+            left_foot_normal_z,
+            min=-1.0,
+            max=1.0,
+        )
+
+        right_foot_normal_z = torch.clamp(
+            right_foot_normal_z,
+            min=-1.0,
+            max=1.0,
+        )
+
+        # 0.0 = stopa idealnie poziomo
+        # 1.0 = stopa obrócona o 90 stopni.
+        left_foot_flat_raw = (
+                1.0 - torch.square(left_foot_normal_z)
+        )
+
+        right_foot_flat_raw = (
+                1.0 - torch.square(right_foot_normal_z)
+        )
+
+        # Mały deadband: nie wymagamy laboratoryjnego 0.000 stopnia.
+        flat_deadband = math.sin(
+            math.radians(self.cfg.stand_foot_flat_deadband_deg)
+        ) ** 2
+
+        left_foot_flat_error = torch.clamp(
+            left_foot_flat_raw - flat_deadband,
+            min=0.0,
+        )
+
+        right_foot_flat_error = torch.clamp(
+            right_foot_flat_raw - flat_deadband,
+            min=0.0,
+        )
+
+        # Obie stopy są równie ważne.
+        stand_foot_flat_error = 0.5 * (
+                left_foot_flat_error
+                + right_foot_flat_error
+        )
         # Swing istnieje TYLKO wtedy, gdy:
         #
         # lewa nie dotyka + prawa naprawdę podpiera
@@ -1680,6 +1750,40 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         #     )
         # )
 
+        left_foot_tilt_deg = (
+                torch.acos(
+                    torch.clamp(
+                        torch.abs(left_foot_normal_z),
+                        min=0.0,
+                        max=1.0,
+                    )
+                )
+                * (180.0 / math.pi)
+        )
+
+        right_foot_tilt_deg = (
+                torch.acos(
+                    torch.clamp(
+                        torch.abs(right_foot_normal_z),
+                        min=0.0,
+                        max=1.0,
+                    )
+                )
+                * (180.0 / math.pi)
+        )
+
+        self._episode_sums["stand_left_foot_tilt_deg_debug"] += (
+                left_foot_tilt_deg
+                * stand_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["stand_right_foot_tilt_deg_debug"] += (
+                right_foot_tilt_deg
+                * stand_gate
+                * self.step_dt
+        )
+
         rewards = {
             "alive": (
                 self.cfg.rew_scale_alive
@@ -1900,6 +2004,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             #         * stand_gate
             #         * self.step_dt
             # ),
+            "stand_foot_flat": (
+                    self.cfg.rew_scale_stand_foot_flat
+                    * stand_foot_flat_error
+                    * stand_gate
+                    * self.step_dt
+            ),
 
         }
 

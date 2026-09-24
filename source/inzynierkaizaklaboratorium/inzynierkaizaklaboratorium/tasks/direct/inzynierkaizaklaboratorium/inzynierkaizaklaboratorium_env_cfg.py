@@ -258,5 +258,9 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
 
     stand_ankle_sym_deadband = 0.02
 
-    rew_scale_stand_ankle_sym = -8.0
+    rew_scale_stand_ankle_sym = 0.0
     # rew_scale_stand_obrot9_extra = -10.0
+
+    # --- PŁASKIE STOPY PODCZAS STANIA ---
+    stand_foot_flat_deadband_deg = 4.0
+    rew_scale_stand_foot_flat = -15.0
