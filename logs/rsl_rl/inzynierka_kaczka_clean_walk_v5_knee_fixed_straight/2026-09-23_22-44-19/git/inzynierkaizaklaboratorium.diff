@@ -1,0 +1,53 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+index c014cd1..1ba3026 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+@@ -568,8 +568,13 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         # Aktywne wyłącznie dla zerowej komendy.
+         # ============================================================
+ 
++        stand_pose_excess = torch.clamp(
++            torch.abs(joint_delta_all) - 0.10,
++            min=0.0,
++        )
++
+         stand_pose_error = torch.mean(
+-            torch.square(joint_delta_all),
++            torch.square(stand_pose_excess),
+             dim=1,
+         )
+ 
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+index 47e2176..ee52426 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+@@ -218,10 +218,10 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+     stand_pose_sigma = 0.025
+     stand_height_sigma = 0.025
+ 
+-    rew_scale_stand_pose = -6.0
+-    rew_scale_stand_height = 2.0
++    rew_scale_stand_pose = -15.0
++    rew_scale_stand_height = 0.0
+     rew_scale_stand_joint_vel = -0.5
+-    rew_scale_stand_double_contact = 1.0
++    rew_scale_stand_double_contact = 0.2
+ 
+-    rew_scale_stand_lin_vel = -8.0
+-    rew_scale_stand_yaw_vel = -3.0
++    rew_scale_stand_lin_vel = -10.0
++    rew_scale_stand_yaw_vel = -4.0

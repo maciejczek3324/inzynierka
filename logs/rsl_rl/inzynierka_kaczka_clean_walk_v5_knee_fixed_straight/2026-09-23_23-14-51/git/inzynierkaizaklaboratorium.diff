@@ -1,0 +1,92 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+index c014cd1..766eab1 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+@@ -243,6 +243,8 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+ 
+                 "stand_lin_vel",
+                 "stand_yaw_vel",
++                "stand_upright",
++                "stand_tilt_debug",
+             ]
+         }
+ 
+@@ -568,8 +570,17 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         # Aktywne wyłącznie dla zerowej komendy.
+         # ============================================================
+ 
++        stand_pose_excess = torch.clamp(
++            torch.abs(joint_delta_all) - 0.10,
++            min=0.0,
++        )
++
+         stand_pose_error = torch.mean(
+-            torch.square(joint_delta_all),
++            torch.square(stand_pose_excess),
++            dim=1,
++        )
++        stand_tilt_error = torch.sum(
++            torch.square(self._robot.data.projected_gravity_b[:, :2]),
+             dim=1,
+         )
+ 
+@@ -1754,6 +1765,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                     * stand_gate
+                     * self.step_dt
+             ),
++            "stand_upright": (
++                    self.cfg.rew_scale_stand_upright
++                    * stand_tilt_error
++                    * stand_gate
++                    * self.step_dt
++            ),
+ 
+         }
+ 
+@@ -1930,6 +1947,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                 * stand_gate
+                 * self.step_dt
+         )
++        self._episode_sums["stand_tilt_debug"] += (
++                stand_tilt_error
++                * stand_gate
++                * self.step_dt
++        )
+         return reward
+ 
+     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+index 47e2176..16ad3d0 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+@@ -218,10 +218,11 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+     stand_pose_sigma = 0.025
+     stand_height_sigma = 0.025
+ 
+-    rew_scale_stand_pose = -6.0
+-    rew_scale_stand_height = 2.0
++    rew_scale_stand_pose = -40.0
++    rew_scale_stand_height = 0.0
+     rew_scale_stand_joint_vel = -0.5
+-    rew_scale_stand_double_contact = 1.0
++    rew_scale_stand_double_contact = 0.2
+ 
+-    rew_scale_stand_lin_vel = -8.0
+-    rew_scale_stand_yaw_vel = -3.0
++    rew_scale_stand_lin_vel = -10.0
++    rew_scale_stand_yaw_vel = -4.0
++    rew_scale_stand_upright = -20.0
