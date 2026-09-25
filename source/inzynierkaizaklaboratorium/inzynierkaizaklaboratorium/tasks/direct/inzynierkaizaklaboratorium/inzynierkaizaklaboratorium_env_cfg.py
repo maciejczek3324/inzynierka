@@ -114,8 +114,8 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Startujemy od prostego chodu do przodu.
     # Cały reward i obserwacje są już 2D+yaw, więc później zmieniasz tylko
     # command_mode na "omni" bez przebudowy sieci.
-    command_mode = "forward"
-    forward_command_x = 0.0 #docelowo 0.12
+    command_mode = "forward_backward"
+    forward_command_x = -0.06 #docelowo 0.12
 
     # TRAINING: losowana prędkość do przodu.
     # forward_command_min = 0.08
@@ -264,3 +264,16 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # --- PŁASKIE STOPY PODCZAS STANIA ---
     stand_foot_flat_deadband_deg = 4.0
     rew_scale_stand_foot_flat = -15.0
+
+    backward_command_min = 0.03
+    backward_command_max = 0.06
+
+    # Spośród KOMEND RUCHU 1/3 będzie do tyłu.
+    # Przy stand=25% daje około:
+    # 25% stand
+    # 25% backward
+    # 50% forward
+    backward_probability = 2.0 / 3.0
+    rew_scale_backward_discovery = 25.0
+    rew_scale_backward_track = 10.0
+    backward_tracking_sigma = 0.003

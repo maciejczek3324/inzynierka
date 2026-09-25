@@ -1,0 +1,595 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+	modified:   source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	"pr\303\263by in\305\274ynierka nagrania zmiany/gibanie pr\303\263by na ty\305\202.mp4"
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+index 1d424d3..ee20021 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env.py
+@@ -252,19 +252,31 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                 "stand_knee_sym",
+                 "stand_knee_sym_debug",
+ 
+-                "stand_obrot9_debug",
+-                "stand_obrot10_debug",
++                # "stand_obrot9_debug",
++                # "stand_obrot10_debug",
+                 "stand_obrot9_abs_debug",
+                 "stand_obrot10_abs_debug",
+-                "stand_obrot10",
++                # "stand_obrot10",
+                 "stand_ankle_sym",
+-                "stand_obrot9_extra",
++                # "stand_obrot9_extra",
+                 # "stand_obrot9_abs_debug",
+                 # "stand_obrot10_abs_debug",
+                 "stand_ankle_sym_debug",
+                 "stand_foot_flat",
+                 "stand_left_foot_tilt_deg_debug",
+                 "stand_right_foot_tilt_deg_debug",
++                "backward_fraction_debug",
++                "backward_command_debug",
++                "backward_vel_debug",
++                "backward_error_debug",
++                "backward_cross_speed_debug",
++
++                "forward_fraction_debug",
++                "forward_only_command_debug",
++                "forward_only_vel_debug",
++                "forward_only_error_debug",
++                "backward_discovery",
++                "backward_track",
+             ]
+         }
+ 
+@@ -335,6 +347,89 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                 )
+ 
+                 self._commands[target_env_ids, 0] = forward_speed
++        elif self.cfg.command_mode == "forward_backward":
++            n = len(env_ids)
++
++            selector = torch.rand(
++                n,
++                device=self.device,
++            )
++
++            stand_mask = (
++                    selector < self.cfg.standing_command_probability
++            )
++
++            moving_mask = ~stand_mask
++
++            direction_selector = torch.rand(
++                n,
++                device=self.device,
++            )
++
++            backward_mask = (
++                    moving_mask
++                    & (
++                            direction_selector
++                            < self.cfg.backward_probability
++                    )
++            )
++
++            forward_mask = (
++                    moving_mask
++                    & (~backward_mask)
++            )
++
++            # --------------------------------------------------------
++            # FORWARD
++            # --------------------------------------------------------
++
++            forward_local_ids = torch.nonzero(
++                forward_mask,
++                as_tuple=False,
++            ).flatten()
++
++            if len(forward_local_ids) > 0:
++                target_env_ids = env_ids[forward_local_ids]
++
++                speed = (
++                        self.cfg.forward_command_min
++                        + (
++                                self.cfg.forward_command_max
++                                - self.cfg.forward_command_min
++                        )
++                        * torch.rand(
++                    len(forward_local_ids),
++                    device=self.device,
++                )
++                )
++
++                self._commands[target_env_ids, 0] = speed
++
++            # --------------------------------------------------------
++            # BACKWARD
++            # --------------------------------------------------------
++
++            backward_local_ids = torch.nonzero(
++                backward_mask,
++                as_tuple=False,
++            ).flatten()
++
++            if len(backward_local_ids) > 0:
++                target_env_ids = env_ids[backward_local_ids]
++
++                speed = (
++                        self.cfg.backward_command_min
++                        + (
++                                self.cfg.backward_command_max
++                                - self.cfg.backward_command_min
++                        )
++                        * torch.rand(
++                    len(backward_local_ids),
++                    device=self.device,
++                )
++                )
++
++                self._commands[target_env_ids, 0] = -speed
+ 
+         elif self.cfg.command_mode == "omni":
+             n = len(env_ids)
+@@ -379,7 +474,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         else:
+             raise ValueError(
+                 f"Nieznany command_mode: {self.cfg.command_mode!r}. "
+-                "Użyj 'forward' albo 'omni'."
++                "Użyj 'forward', 'forward_backward' albo 'omni'."
+             )
+ 
+         self._command_timer[env_ids] = self.cfg.command_resample_time_s
+@@ -478,6 +573,64 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         forward_vel = self._robot.data.root_lin_vel_b[:, 0]
+         lateral_vel = self._robot.data.root_lin_vel_b[:, 1]
+         yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
++
++        # ============================================================
++        # RUCH WZGLĘDEM KIERUNKU KOMENDY
++        # Działa dla przód / tył / bok / skos.
++        # ============================================================
++
++        vel_xy = self._robot.data.root_lin_vel_b[:, :2]
++        cmd_xy = self._commands[:, :2]
++
++        command_speed = torch.norm(
++            cmd_xy,
++            dim=1,
++        )
++
++        move_gate = (
++                command_speed > 0.05
++        ).float()
++
++        stand_gate = (
++                (command_speed <= 0.05)
++                & (torch.abs(self._commands[:, 2]) <= 0.05)
++        ).float()
++
++        forward_cmd_gate = (
++                self._commands[:, 0] > 0.05
++        ).float()
++
++        backward_cmd_gate = (
++                self._commands[:, 0] < -0.05
++        ).float()
++
++        safe_command_speed = torch.clamp(
++            command_speed,
++            min=0.01,
++        )
++
++        cmd_dir = (
++                cmd_xy
++                / safe_command_speed.unsqueeze(1)
++        )
++
++        cmd_dir *= move_gate.unsqueeze(1)
++
++        # Prędkość dokładnie W KIERUNKU zadanej komendy.
++        vel_along_cmd = torch.sum(
++            vel_xy * cmd_dir,
++            dim=1,
++        )
++
++        # Prędkość PROSTOPADŁA do zadanej komendy.
++        # Forward -> to jest vy.
++        # Backward -> -vy.
++        # Bok -> głównie vx.
++        vel_cross_cmd = (
++                cmd_dir[:, 0] * vel_xy[:, 1]
++                - cmd_dir[:, 1] * vel_xy[:, 0]
++        )
++
+         # ============================================================
+         # DEBUG POZYCJI STAWÓW WZGLĘDEM POZYCJI NEUTRALNEJ
+         # ============================================================
+@@ -543,9 +696,16 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         track_yaw_vel = torch.exp(
+             -yaw_error / self.cfg.yaw_vel_tracking_sigma
+         )
++        # lateral_factor = torch.exp(
++        #     -torch.square(
++        #         lateral_vel / self.cfg.straightness_lateral_sigma
++        #     )
++        # )
++
+         lateral_factor = torch.exp(
+             -torch.square(
+-                lateral_vel / self.cfg.straightness_lateral_sigma
++                vel_cross_cmd
++                / self.cfg.straightness_lateral_sigma
+             )
+         )
+ 
+@@ -572,19 +732,19 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         # KOMENDA RUCHU / JAKOŚĆ RUCHU W KIERUNKU KOMENDY
+         # ============================================================
+ 
+-        command_speed = torch.norm(
+-            self._commands[:, :2],
+-            dim=1,
+-        )
+-
+-        move_gate = (
+-                command_speed > 0.05
+-        ).float()
+-
+-        stand_gate = (
+-                (command_speed <= 0.05)
+-                & (torch.abs(self._commands[:, 2]) <= 0.05)
+-        ).float()
++        # command_speed = torch.norm(
++        #     self._commands[:, :2],
++        #     dim=1,
++        # )
++        #
++        # move_gate = (
++        #         command_speed > 0.05
++        # ).float()
++        #
++        # stand_gate = (
++        #         (command_speed <= 0.05)
++        #         & (torch.abs(self._commands[:, 2]) <= 0.05)
++        # ).float()
+         # ============================================================
+         # STANDING
+         # Aktywne wyłącznie dla zerowej komendy.
+@@ -639,10 +799,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         # Stały dryf w jedną stronę pozostaje.
+         # ============================================================
+ 
+-        lateral_error = (
+-                lateral_vel
+-                - self._commands[:, 1]
+-        )
++        # lateral_error = (
++        #         lateral_vel
++        #         - self._commands[:, 1]
++        # )
++
++        lateral_error = vel_cross_cmd
+ 
+         alpha = self.cfg.lateral_bias_alpha
+ 
+@@ -672,20 +834,57 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         #     min=0.0,
+         #     max=1.0,
+         # )
+-        safe_forward_command = torch.clamp(
+-            self._commands[:, 0],
+-            min=0.01,
+-        )
++        # safe_forward_command = torch.clamp(
++        #     self._commands[:, 0],
++        #     min=0.01,
++        # )
++        #
++        # forward_quality = torch.clamp(
++        #     forward_vel / safe_forward_command,
++        #     min=0.0,
++        #     max=1.0,
++        # )
++        #
++        # # Przy komendzie 0.0 nie ma jakości "chodu".
++        # forward_quality *= move_gate
+ 
+         forward_quality = torch.clamp(
+-            forward_vel / safe_forward_command,
++            vel_along_cmd / safe_command_speed,
+             min=0.0,
+             max=1.0,
+         )
+ 
+-        # Przy komendzie 0.0 nie ma jakości "chodu".
+         forward_quality *= move_gate
+ 
++        # ============================================================
++        # BOOTSTRAP CHODU DO TYŁU
++        # ============================================================
++
++        backward_cmd_gate = (
++                self._commands[:, 0] < -0.05
++        ).float()
++
++        # 0 = brak cofania
++        # 1 = osiągnięta lub przekroczona zadana prędkość cofania
++        backward_progress_quality = (
++                forward_quality
++                * backward_cmd_gate
++        )
++
++        # Podczas nauki tyłu nie płacimy pełnej nagrody
++        # za samo dreptanie w miejscu.
++        backward_motion_gate = (
++                1.0
++                - backward_cmd_gate
++                + backward_cmd_gate
++                * (
++                        0.25
++                        + 0.75 * backward_progress_quality
++                )
++        )
++
++        motion_quality = forward_quality
++
+         # straightness_gate = (
+         #         0.25
+         #         + 0.75 * forward_quality
+@@ -1474,7 +1673,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         step_complete = (
+                                 left_step_complete
+                                 + right_step_complete
+-                        ) * move_gate * step_direction_gate * knee_step_gate
++                        ) * move_gate * step_direction_gate * knee_step_gate *backward_motion_gate
+         # self._episode_sums["left_step_debug"] += left_step_complete
+         # self._episode_sums["right_step_debug"] += right_step_complete
+         # step_motion_gate = (
+@@ -1668,10 +1867,18 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         #     max=1.0,
+         # )
+ 
+-        forward_progress = forward_vel
++        # forward_progress = forward_vel
++        #
++        # progress_quality = torch.clamp(
++        #     forward_progress / safe_forward_command,
++        #     min=-1.0,
++        #     max=1.0,
++        # )
++
++        forward_progress = vel_along_cmd
+ 
+         progress_quality = torch.clamp(
+-            forward_progress / safe_forward_command,
++            forward_progress / safe_command_speed,
+             min=-1.0,
+             max=1.0,
+         )
+@@ -1772,6 +1979,39 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                 * (180.0 / math.pi)
+         )
+ 
++        backward_speed = torch.clamp(
++            -forward_vel,
++            min=0.0,
++        )
++
++        backward_target_speed = torch.clamp(
++            -self._commands[:, 0],
++            min=0.01,
++        )
++
++        backward_speed_ratio = torch.clamp(
++            backward_speed / backward_target_speed,
++            min=0.0,
++            max=1.0,
++        )
++
++        backward_discovery_quality = backward_cmd_gate * (
++                0.35 * torch.tanh(backward_speed / 0.012)
++                + 0.65 * backward_speed_ratio
++        )
++
++        backward_velocity_error = (
++                                          forward_vel - self._commands[:, 0]
++                                  ) ** 2
++
++        backward_track_quality = (
++                torch.exp(
++                    -backward_velocity_error
++                    / self.cfg.backward_tracking_sigma
++                )
++                * backward_cmd_gate
++        )
++
+         self._episode_sums["stand_left_foot_tilt_deg_debug"] += (
+                 left_foot_tilt_deg
+                 * stand_gate
+@@ -1871,9 +2111,15 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                     * overlong_swing
+                     * self.step_dt
+             ),
++            # "lateral_vel": (
++            #         self.cfg.rew_scale_lateral_vel
++            #         * torch.square(lateral_vel)
++            #         * dt
++            # ),
+             "lateral_vel": (
+                     self.cfg.rew_scale_lateral_vel
+-                    * torch.square(lateral_vel)
++                    * torch.square(vel_cross_cmd)
++                    * move_gate
+                     * dt
+             ),
+             # "yaw_rate": (
+@@ -1914,6 +2160,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                     self.cfg.rew_scale_knee_pair_use
+                     * knee_pair_quality
+                     * move_gate
++                    * backward_motion_gate
+                     * dt
+             ),
+             "roll_bias": (
+@@ -2010,6 +2257,25 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+                     * stand_gate
+                     * self.step_dt
+             ),
++            # "backward_discovery": (
++            #         self.cfg.rew_scale_backward_discovery
++            #         * backward_progress_quality
++            #         * upright_gate
++            #         * self.step_dt
++            # ),
++            "backward_discovery": (
++                    self.cfg.rew_scale_backward_discovery
++                    * backward_discovery_quality
++                    * upright_gate
++                    * self.step_dt
++            ),
++
++            "backward_track": (
++                    self.cfg.rew_scale_backward_track
++                    * backward_track_quality
++                    * upright_gate
++                    * self.step_dt
++            ),
+ 
+         }
+ 
+@@ -2218,17 +2484,17 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         #         * stand_gate
+         #         * self.step_dt
+         # )
+-        self._episode_sums["stand_obrot9_abs_debug"] += (
+-                torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot9"]])
+-                * stand_gate
+-                * self.step_dt
+-        )
+-
+-        self._episode_sums["stand_obrot10_abs_debug"] += (
+-                torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot10"]])
+-                * stand_gate
+-                * self.step_dt
+-        )
++        # self._episode_sums["stand_obrot9_abs_debug"] += (
++        #         torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot9"]])
++        #         * stand_gate
++        #         * self.step_dt
++        # )
++        #
++        # self._episode_sums["stand_obrot10_abs_debug"] += (
++        #         torch.abs(joint_delta_all[:, self.debug_joint_indices["obrot10"]])
++        #         * stand_gate
++        #         * self.step_dt
++        # )
+         self._episode_sums["stand_obrot9_abs_debug"] += (
+                 obrot9_abs * stand_gate * self.step_dt
+         )
+@@ -2240,6 +2506,58 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
+         self._episode_sums["stand_ankle_sym_debug"] += (
+                 torch.abs(obrot9_abs - obrot10_abs) * stand_gate * self.step_dt
+         )
++        self._episode_sums["backward_fraction_debug"] += (
++                backward_cmd_gate * self.step_dt
++        )
++
++        self._episode_sums["backward_command_debug"] += (
++                torch.abs(self._commands[:, 0])
++                * backward_cmd_gate
++                * self.step_dt
++        )
++
++        self._episode_sums["backward_vel_debug"] += (
++                (-forward_vel)
++                * backward_cmd_gate
++                * self.step_dt
++        )
++
++        self._episode_sums["backward_error_debug"] += (
++                torch.abs(
++                    self._commands[:, 0] - forward_vel
++                )
++                * backward_cmd_gate
++                * self.step_dt
++        )
++
++        self._episode_sums["backward_cross_speed_debug"] += (
++                torch.abs(vel_cross_cmd)
++                * backward_cmd_gate
++                * self.step_dt
++        )
++        self._episode_sums["forward_fraction_debug"] += (
++                forward_cmd_gate * self.step_dt
++        )
++
++        self._episode_sums["forward_only_command_debug"] += (
++                self._commands[:, 0]
++                * forward_cmd_gate
++                * self.step_dt
++        )
++
++        self._episode_sums["forward_only_vel_debug"] += (
++                forward_vel
++                * forward_cmd_gate
++                * self.step_dt
++        )
++
++        self._episode_sums["forward_only_error_debug"] += (
++                torch.abs(
++                    self._commands[:, 0] - forward_vel
++                )
++                * forward_cmd_gate
++                * self.step_dt
++        )
+         return reward
+ 
+     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+diff --git a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+index 0aff953..4123a0c 100644
+--- a/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
++++ b/source/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium/tasks/direct/inzynierkaizaklaboratorium/inzynierkaizaklaboratorium_env_cfg.py
+@@ -114,8 +114,8 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+     # Startujemy od prostego chodu do przodu.
+     # Cały reward i obserwacje są już 2D+yaw, więc później zmieniasz tylko
+     # command_mode na "omni" bez przebudowy sieci.
+-    command_mode = "forward"
+-    forward_command_x = 0.0 #docelowo 0.12
++    command_mode = "forward_backward"
++    forward_command_x = 0.06 #docelowo 0.12
+ 
+     # TRAINING: losowana prędkość do przodu.
+     # forward_command_min = 0.08
+@@ -264,3 +264,16 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+     # --- PŁASKIE STOPY PODCZAS STANIA ---
+     stand_foot_flat_deadband_deg = 4.0
+     rew_scale_stand_foot_flat = -15.0
++
++    backward_command_min = 0.03
++    backward_command_max = 0.06
++
++    # Spośród KOMEND RUCHU 1/3 będzie do tyłu.
++    # Przy stand=25% daje około:
++    # 25% stand
++    # 25% backward
++    # 50% forward
++    backward_probability = 2.0 / 3.0
++    rew_scale_backward_discovery = 25.0
++    rew_scale_backward_track = 10.0
++    backward_tracking_sigma = 0.003
