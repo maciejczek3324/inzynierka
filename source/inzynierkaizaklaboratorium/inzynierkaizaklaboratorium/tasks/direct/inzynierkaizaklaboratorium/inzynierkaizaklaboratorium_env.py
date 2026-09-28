@@ -13,6 +13,8 @@ from isaaclab.devices import Se3Gamepad
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import ContactSensor
 
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
 from .inzynierkaizaklaboratorium_env_cfg import InzynierkaizaklaboratoriumEnvCfg
 
 
@@ -48,6 +50,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self.knee_l_idx = self._robot.data.joint_names.index("obrot8")
         self.knee_r_idx = self._robot.data.joint_names.index("obrot7")
 
+        self._backward_vel_ema = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
         self.gamepad = None
 
         if self.num_envs == 1:
@@ -67,8 +74,50 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             self.num_envs,
             device=self.device,
         )
+
+        # ============================================================
+        # BACKWARD - PRAWDZIWY SWING
+        # Osobny od forward, żeby nie rozwalić działającego chodu.
+        # ============================================================
+
+        self._left_backward_swing_time = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
+        self._right_backward_swing_time = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
+        self._backward_double_support_time = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
         self._left_swing_ema = torch.zeros(
             self.num_envs,
+            device=self.device,
+        )
+
+        self._left_bw_real_swing_ema = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
+        self._right_bw_real_swing_ema = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+        self._left_bw_real_lift_seen = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        self._right_bw_real_lift_seen = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
             device=self.device,
         )
         self._left_knee_flex_ema = torch.zeros(
@@ -116,6 +165,46 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         #     dtype=torch.int8,
         #     device=self.device,
         # )
+        # ============================================================
+        # PAMIĘĆ OSTATNIEGO POPRAWNEGO KROKU BACKWARD
+        #
+        #  0  -> jeszcze żadnego kroku
+        # -1  -> ostatni poprawny krok zrobiła LEWA
+        # +1  -> ostatni poprawny krok zrobiła PRAWA
+        # ============================================================
+
+        self._last_backward_step = torch.zeros(
+            self.num_envs,
+            dtype=torch.int8,
+            device=self.device,
+        )
+        # ============================================================
+        # NOWA alternacja dla PRAWDZIWYCH directional backward steps
+        #
+        #  0 = jeszcze brak kroku
+        # -1 = ostatni krok zrobiła LEWA
+        # +1 = ostatni krok zrobiła PRAWA
+        # ============================================================
+
+        self._last_backward_directional_step = torch.zeros(
+            self.num_envs,
+            dtype=torch.int8,
+            device=self.device,
+        )
+
+
+        self._left_bw_swing_start_xy = torch.zeros(
+            self.num_envs,
+            2,
+            device=self.device,
+        )
+
+        self._right_bw_swing_start_xy = torch.zeros(
+            self.num_envs,
+            2,
+            device=self.device,
+        )
+
         self._prev_root_pos = self._robot.data.root_pos_w.clone()
         self._lateral_vel_ema = torch.zeros(
             self.num_envs,
@@ -277,6 +366,53 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "forward_only_error_debug",
                 "backward_discovery",
                 "backward_track",
+                "backward_signed_progress",
+
+                "backward_foot_placement_debug",
+                "backward_foot_placement_gate_debug",
+
+                "backward_alt_step",
+                "backward_left_alt_step_debug",
+                "backward_right_alt_step_debug",
+                "backward_repeat_reject_debug",
+
+                "backward_touchdown_debug",
+                "backward_time_valid_debug",
+
+                "backward_real_single_support",
+                "backward_premature_touchdown",
+                "backward_contact_slip",
+                "backward_shuffle",
+
+                "backward_real_left_swing_debug",
+                "backward_real_right_swing_debug",
+
+                "backward_load_transfer",
+
+                "backward_swing_direction",
+                "backward_step_direction",
+
+                "backward_swing_direction",
+                "backward_step_direction",
+
+                # BACKWARD STRAIGHTENING DEBUG
+                "backward_straightness_gate_debug",
+                "backward_straight_lateral_factor_debug",
+                "backward_straight_yaw_factor_debug",
+                "backward_yaw_rate_debug",
+
+                "backward_expected_swing_lift",
+                "backward_expected_foot_slip",
+
+                "backward_left_directional_step_debug",
+                "backward_right_directional_step_debug",
+                "backward_directional_repeat_debug",
+
+                "backward_real_pair_use",
+                "backward_real_swing_balance",
+
+                "backward_left_real_use_debug",
+                "backward_right_real_use_debug",
             ]
         }
 
@@ -373,6 +509,8 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                             < self.cfg.backward_probability
                     )
             )
+
+            backward_mask_f = backward_mask.float()
 
             forward_mask = (
                     moving_mask
@@ -570,39 +708,120 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         # Główny cel: 2D velocity tracking w układzie robota.
-        forward_vel = self._robot.data.root_lin_vel_b[:, 0]
-        lateral_vel = self._robot.data.root_lin_vel_b[:, 1]
+        # forward_vel = self._robot.data.root_lin_vel_b[:, 0]
+        # lateral_vel = self._robot.data.root_lin_vel_b[:, 1]
+        # yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
+        #
+        # # ============================================================
+        # # RUCH WZGLĘDEM KIERUNKU KOMENDY
+        # # Działa dla przód / tył / bok / skos.
+        # # ============================================================
+        #
+        # vel_xy = self._robot.data.root_lin_vel_b[:, :2]
+
+        # ============================================================
+        # PRĘDKOŚĆ PLANARNA W UKŁADZIE HEADING
+        # ignorujemy pitch/roll przy wyznaczaniu kierunku ruchu
+        # ============================================================
+
+        heading_quat = yaw_quat(
+            self._robot.data.root_quat_w
+        )
+
+        lin_vel_heading = quat_apply_inverse(
+            heading_quat,
+            self._robot.data.root_lin_vel_w,
+        )
+
+        forward_vel = lin_vel_heading[:, 0]
+        lateral_vel = lin_vel_heading[:, 1]
+
+        vel_xy = lin_vel_heading[:, :2]
+
         yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
 
-        # ============================================================
-        # RUCH WZGLĘDEM KIERUNKU KOMENDY
-        # Działa dla przód / tył / bok / skos.
-        # ============================================================
-
-        vel_xy = self._robot.data.root_lin_vel_b[:, :2]
         cmd_xy = self._commands[:, :2]
+
+        # command_speed = torch.norm(
+        #     cmd_xy,
+        #     dim=1,
+        # )
+        #
+        # move_gate = (
+        #         command_speed > 0.05
+        # ).float()
+        #
+        # stand_gate = (
+        #         (command_speed <= 0.05)
+        #         & (torch.abs(self._commands[:, 2]) <= 0.05)
+        # ).float()
+        #
+        # forward_cmd_gate = (
+        #         self._commands[:, 0] > 0.05
+        # ).float()
+        #
+        # backward_cmd_gate = (
+        #         self._commands[:, 0] < -0.05
+        # ).float()
 
         command_speed = torch.norm(
             cmd_xy,
             dim=1,
         )
 
+        cmd_threshold = self.cfg.command_move_threshold
+
         move_gate = (
-                command_speed > 0.05
+                command_speed > cmd_threshold
         ).float()
 
         stand_gate = (
-                (command_speed <= 0.05)
-                & (torch.abs(self._commands[:, 2]) <= 0.05)
+                (command_speed <= cmd_threshold)
+                & (
+                        torch.abs(self._commands[:, 2])
+                        <= cmd_threshold
+                )
         ).float()
 
         forward_cmd_gate = (
-                self._commands[:, 0] > 0.05
+                self._commands[:, 0] > cmd_threshold
         ).float()
 
         backward_cmd_gate = (
-                self._commands[:, 0] < -0.05
+                self._commands[:, 0] < -cmd_threshold
         ).float()
+        # ============================================================
+        # PRAWDZIWY NETTO RUCH DO TYŁU
+        # ============================================================
+
+        backward_signed_speed = -forward_vel
+
+        alpha = self.cfg.backward_velocity_ema_alpha
+
+        updated_backward_ema = (
+                (1.0 - alpha) * self._backward_vel_ema
+                + alpha * backward_signed_speed
+        )
+
+        self._backward_vel_ema = torch.where(
+            backward_cmd_gate.bool(),
+            updated_backward_ema,
+            torch.zeros_like(updated_backward_ema),
+        )
+
+        backward_target_speed = torch.clamp(
+            -self._commands[:, 0],
+            min=0.01,
+        )
+
+        backward_signed_progress = torch.clamp(
+            self._backward_vel_ema
+            / backward_target_speed,
+            min=-1.0,
+            max=1.0,
+        )
+
+        backward_signed_progress *= backward_cmd_gate
 
         safe_command_speed = torch.clamp(
             command_speed,
@@ -860,9 +1079,9 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         # BOOTSTRAP CHODU DO TYŁU
         # ============================================================
 
-        backward_cmd_gate = (
-                self._commands[:, 0] < -0.05
-        ).float()
+        # backward_cmd_gate = (
+        #         self._commands[:, 0] < -0.05
+        # ).float()
 
         # 0 = brak cofania
         # 1 = osiągnięta lub przekroczona zadana prędkość cofania
@@ -873,13 +1092,68 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
         # Podczas nauki tyłu nie płacimy pełnej nagrody
         # za samo dreptanie w miejscu.
+        # backward_motion_gate = (
+        #         1.0
+        #         - backward_cmd_gate
+        #         + backward_cmd_gate
+        #         * (
+        #                 0.25
+        #                 + 0.75 * backward_progress_quality
+        #         )
+        # )
+
+        # backward_motion_quality = torch.clamp(
+        #     backward_signed_progress,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # backward_motion_gate = (
+        #         1.0
+        #         - backward_cmd_gate
+        #         + backward_cmd_gate
+        #         * (
+        #                 0.05
+        #                 + 0.95 * backward_motion_quality
+        #         )
+        # )
+
+        backward_motion_quality = torch.clamp(
+            backward_signed_progress,
+            min=0.0,
+            max=1.0,
+        )
+
+        # ------------------------------------------------------------
+        # STRICT GATE
+        # Dla rewardów prędkości/progress.
+        # Stanie w miejscu podczas komendy backward dostaje tylko 5%.
+        # ------------------------------------------------------------
         backward_motion_gate = (
                 1.0
                 - backward_cmd_gate
                 + backward_cmd_gate
                 * (
+                        0.05
+                        + 0.95 * backward_motion_quality
+                )
+        )
+
+        # ------------------------------------------------------------
+        # GAIT GATE
+        # Mechanika kroku musi mieć możliwość eksploracji,
+        # nawet zanim robot nauczy się naprawdę cofać.
+        #
+        # 25% rewardu za krok przy zerowym ruchu,
+        # 100% gdy realizuje backward.
+        # ------------------------------------------------------------
+        backward_gait_gate = (
+                1.0
+                - backward_cmd_gate
+                + backward_cmd_gate
+                * (
                         0.25
-                        + 0.75 * backward_progress_quality
+                        + 0.75 * backward_motion_quality
                 )
         )
 
@@ -969,6 +1243,135 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         right_contact = (
             self._right_foot_contact.data.current_contact_time[:, 0] > 0.0
         )
+
+        # ============================================================
+        # BACKWARD - BIPED SINGLE STANCE
+        #
+        # Wzorowane na feet_air_time_positive_biped z Isaac Lab.
+        # NIE wymagamy tutaj clearance.
+        # NIE używamy history-max do wykrywania swingu.
+        # ============================================================
+
+        left_air_time_bw = (
+            self._left_foot_contact.data.current_air_time[:, 0]
+        )
+
+        right_air_time_bw = (
+            self._right_foot_contact.data.current_air_time[:, 0]
+        )
+
+        left_contact_time_bw = (
+            self._left_foot_contact.data.current_contact_time[:, 0]
+        )
+
+        right_contact_time_bw = (
+            self._right_foot_contact.data.current_contact_time[:, 0]
+        )
+
+        # ============================================================
+        # AIR MATURITY
+        #
+        # < 0.04 s = ZERO rewardu.
+        # Dopiero prawdziwa faza air zaczyna się liczyć.
+        # ============================================================
+
+        air_span = (
+                self.cfg.backward_step_air_target
+                - self.cfg.backward_air_deadband
+        )
+
+        left_bw_air_quality = torch.clamp(
+            (
+                    left_air_time_bw
+                    - self.cfg.backward_air_deadband
+            ) / air_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_bw_air_quality = torch.clamp(
+            (
+                    right_air_time_bw
+                    - self.cfg.backward_air_deadband
+            ) / air_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        left_mode_time_bw = torch.where(
+            left_contact,
+            left_contact_time_bw,
+            left_air_time_bw,
+        )
+
+        right_mode_time_bw = torch.where(
+            right_contact,
+            right_contact_time_bw,
+            right_air_time_bw,
+        )
+
+        backward_single_stance_mask = (
+                backward_cmd_gate.bool()
+                & (left_contact ^ right_contact)
+        )
+
+        # Ile czasu para nóg utrzymuje aktualny układ:
+        # jedna kontakt, druga air.
+        backward_single_stance_time = torch.minimum(
+            left_mode_time_bw,
+            right_mode_time_bw,
+        )
+
+        # 0 -> nic
+        # 0.05 s -> 0.5
+        # >=0.10 s -> 1.0
+        backward_single_stance_quality = torch.clamp(
+            backward_single_stance_time
+            / self.cfg.backward_air_time_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_single_stance_quality *= (
+            backward_single_stance_mask.float()
+        )
+
+        # ============================================================
+        # FILTROWANY KONTAKT TYLKO DLA BACKWARD
+        #
+        # Nie ufamy pojedynczej próbce kontaktu.
+        # Bierzemy maksimum z historii siły kontaktu.
+        # ============================================================
+
+        left_force_history = torch.norm(
+            self._left_foot_contact.data.net_forces_w_history[:, :, 0, :],
+            dim=-1,
+        )
+
+        right_force_history = torch.norm(
+            self._right_foot_contact.data.net_forces_w_history[:, :, 0, :],
+            dim=-1,
+        )
+
+        left_contact_bw = (
+                torch.max(left_force_history, dim=1).values > 1.0
+        )
+
+        right_contact_bw = (
+                torch.max(right_force_history, dim=1).values > 1.0
+        )
+
+        backward_double_support = (
+                left_contact_bw & right_contact_bw
+        )
+
+        self._backward_double_support_time = torch.where(
+            backward_cmd_gate.bool() & backward_double_support,
+            self._backward_double_support_time + self.step_dt,
+            torch.zeros_like(self._backward_double_support_time),
+        )
+
+
         # ============================================================
         # OBCIĄŻENIE STÓP
         # ============================================================
@@ -1009,6 +1412,23 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         pos_r = self._robot.data.body_pos_w[
             :, self.stopa_r_idx, :
         ]
+
+        # ============================================================
+        # POZYCJA STOPY WZGLĘDEM BAZY W UKŁADZIE HEADING
+        # ============================================================
+
+        root_pos_w = self._robot.data.root_pos_w
+
+        left_foot_rel_heading = quat_apply_inverse(
+            heading_quat,
+            pos_l - root_pos_w,
+        )
+
+        right_foot_rel_heading = quat_apply_inverse(
+            heading_quat,
+            pos_r - root_pos_w,
+        )
+
         # ============================================================
         # PŁASKOŚĆ STÓP PODCZAS STANIA
         #
@@ -1087,6 +1507,145 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
         left_swing = (~left_contact) & right_contact
         right_swing = (~right_contact) & left_contact
+        # ============================================================
+        # BACKWARD LIFTOFF
+        # Zapamiętujemy gdzie była stopa, gdy NAPRAWDĘ straciła kontakt.
+        # ============================================================
+
+        left_bw_liftoff = (
+                backward_cmd_gate.bool()
+                & (~left_contact)
+                & self._prev_left_contact
+                & right_contact
+        )
+
+        right_bw_liftoff = (
+                backward_cmd_gate.bool()
+                & (~right_contact)
+                & self._prev_right_contact
+                & left_contact
+        )
+
+        self._left_bw_swing_start_xy = torch.where(
+            left_bw_liftoff.unsqueeze(1),
+            left_foot_rel_heading[:, :2],
+            self._left_bw_swing_start_xy,
+        )
+
+        self._right_bw_swing_start_xy = torch.where(
+            right_bw_liftoff.unsqueeze(1),
+            right_foot_rel_heading[:, :2],
+            self._right_bw_swing_start_xy,
+        )
+
+        # ============================================================
+        # KIERUNEK STAWIANIA STOPY WZGLĘDEM KOMENDY
+        #
+        # Sprawdzamy, czy stopa swing znajduje się PRZED nogą podporową
+        # w kierunku zadanej komendy.
+        #
+        # Dla forward:
+        #   stopa swing przed podporową -> dobrze
+        #
+        # Dla backward:
+        #   stopa swing za podporową -> dobrze
+        #
+        # Wszystko liczone w układzie HEADING robota.
+        # ============================================================
+
+        foot_delta_w = (
+                pos_l
+                - pos_r
+        )
+
+        foot_delta_heading = quat_apply_inverse(
+            heading_quat,
+            foot_delta_w,
+        )
+
+        # Lewa stopa względem prawej, rzut na kierunek komendy.
+        #
+        # > 0 -> lewa znajduje się w DOBRYM kierunku ruchu
+        # < 0 -> lewa znajduje się w przeciwnym kierunku
+        left_placement_along_cmd = torch.sum(
+            foot_delta_heading[:, :2]
+            * cmd_dir,
+            dim=1,
+        )
+
+        # Prawa względem lewej ma dokładnie przeciwny wektor.
+        right_placement_along_cmd = (
+            -left_placement_along_cmd
+        )
+
+        placement_sigma = (
+            self.cfg.backward_foot_placement_sigma
+        )
+
+        # Smooth quality:
+        #
+        # duży minus -> ~0
+        # 0          -> 0.5
+        # duży plus  -> ~1
+        #
+        # Dzięki tanh dostajemy gradient rewardu również ZANIM
+        # stopa przejdzie całkowicie za nogę podporową.
+        left_placement_quality = (
+                0.5
+                * (
+                        1.0
+                        + torch.tanh(
+                            left_placement_along_cmd
+                            / placement_sigma
+                        )
+                )
+        )
+
+        right_placement_quality = (
+                0.5
+                * (
+                        1.0
+                        + torch.tanh(
+                            right_placement_along_cmd
+                            / placement_sigma
+                        )
+                )
+        )
+
+        # Jakość aktualnie poruszanej nogi.
+        active_swing_placement_quality = (
+                left_swing.float()
+                * left_placement_quality
+                +
+                right_swing.float()
+                * right_placement_quality
+        )
+
+        placement_floor = (
+            self.cfg.backward_foot_placement_floor
+        )
+
+        # ============================================================
+        # GATE TYLKO DLA BACKWARD
+        #
+        # Forward / stand -> 1.0, niczego nie zmieniamy.
+        #
+        # Backward:
+        # zła strona stopy -> około floor
+        # dobra strona     -> do 1.0
+        # ============================================================
+
+        backward_swing_placement_gate = (
+                1.0
+                - backward_cmd_gate
+                +
+                backward_cmd_gate
+                * (
+                        placement_floor
+                        + (1.0 - placement_floor)
+                        * active_swing_placement_quality
+                )
+        )
         # ============================================================
         # DŁUGOOKRESOWY BALANS UŻYWANIA LEWEJ / PRAWEJ NOGI
         # Nie narzuca fazy ani częstotliwości chodu.
@@ -1263,6 +1822,252 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             min=0.0,
         )
 
+        # # ============================================================
+        # # BACKWARD SWING DISCOVERY
+        # #
+        # # Reward dostaje JUŻ PODCZAS przenoszenia nogi,
+        # # a nie dopiero po perfekcyjnym touchdownie.
+        # # ============================================================
+        #
+        # left_backward_swing_dir = torch.clamp(
+        #     left_placement_along_cmd / 0.030,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # right_backward_swing_dir = torch.clamp(
+        #     right_placement_along_cmd / 0.030,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # left_backward_lift = torch.clamp(
+        #     left_clearance / 0.020,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # right_backward_lift = torch.clamp(
+        #     right_clearance / 0.020,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # left_backward_time = torch.clamp(
+        #     self._left_swing_time / 0.12,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # right_backward_time = torch.clamp(
+        #     self._right_swing_time / 0.12,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # backward_swing_discovery = (
+        #         backward_cmd_gate
+        #         * (
+        #                 left_swing.float()
+        #                 * left_backward_swing_dir
+        #                 * (0.25 + 0.75 * left_backward_lift)
+        #                 * (0.25 + 0.75 * left_backward_time)
+        #
+        #                 +
+        #
+        #                 right_swing.float()
+        #                 * right_backward_swing_dir
+        #                 * (0.25 + 0.75 * right_backward_lift)
+        #                 * (0.25 + 0.75 * right_backward_time)
+        #         )
+        # )
+
+        # ============================================================
+        # BACKWARD - REALNY SWING
+        #
+        # Sama utrata kontaktu NIE wystarcza.
+        # Stopa musi faktycznie znaleźć się wyżej od podporowej.
+        # ============================================================
+
+        left_backward_real_swing = (
+                backward_cmd_gate.bool()
+                & (~left_contact_bw)
+                & right_contact_bw
+                & (left_clearance >= self.cfg.backward_real_lift_min)
+        )
+
+        right_backward_real_swing = (
+                backward_cmd_gate.bool()
+                & (~right_contact_bw)
+                & left_contact_bw
+                & (right_clearance >= self.cfg.backward_real_lift_min)
+        )
+
+        # ============================================================
+        # BACKWARD REAL-SWING PAIR USE
+        #
+        # Dokładnie idea jak przy forward knee_pair_use:
+        # reward jest dobry dopiero, kiedy OBA kanały są używane.
+        # ============================================================
+
+        bw_pair_alpha = self.cfg.backward_real_pair_alpha
+
+        left_bw_real_ema_updated = (
+                (1.0 - bw_pair_alpha) * self._left_bw_real_swing_ema
+                + bw_pair_alpha * left_backward_real_swing.float()
+        )
+
+        right_bw_real_ema_updated = (
+                (1.0 - bw_pair_alpha) * self._right_bw_real_swing_ema
+                + bw_pair_alpha * right_backward_real_swing.float()
+        )
+
+        self._left_bw_real_swing_ema = torch.where(
+            backward_cmd_gate.bool(),
+            left_bw_real_ema_updated,
+            torch.zeros_like(self._left_bw_real_swing_ema),
+        )
+
+        self._right_bw_real_swing_ema = torch.where(
+            backward_cmd_gate.bool(),
+            right_bw_real_ema_updated,
+            torch.zeros_like(self._right_bw_real_swing_ema),
+        )
+
+        left_bw_real_use = torch.clamp(
+            self._left_bw_real_swing_ema
+            / self.cfg.backward_real_pair_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_bw_real_use = torch.clamp(
+            self._right_bw_real_swing_ema
+            / self.cfg.backward_real_pair_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        # NAJWAŻNIEJSZE:
+        # jeśli jedna noga = 1.0, druga = 0.0,
+        # pair quality = ZERO.
+        backward_real_pair_quality = torch.minimum(
+            left_bw_real_use,
+            right_bw_real_use,
+        )
+
+        backward_real_swing_balance_error = torch.abs(
+            left_bw_real_use
+            - right_bw_real_use
+        )
+
+        # Zapamiętaj, że podczas aktualnego cyklu stopa
+        # NAPRAWDĘ oderwała się od podłoża.
+        left_bw_real_lift_seen = (
+                self._left_bw_real_lift_seen
+                | left_backward_real_swing
+        )
+
+        right_bw_real_lift_seen = (
+                self._right_bw_real_lift_seen
+                | right_backward_real_swing
+        )
+
+        # ------------------------------------------------------------
+        # Czas PRAWDZIWEGO swingu backward.
+        # ------------------------------------------------------------
+
+        self._left_backward_swing_time = torch.where(
+            backward_cmd_gate.bool(),
+            torch.where(
+                left_backward_real_swing,
+                self._left_backward_swing_time + self.step_dt,
+                self._left_backward_swing_time,
+            ),
+            torch.zeros_like(self._left_backward_swing_time),
+        )
+
+        self._right_backward_swing_time = torch.where(
+            backward_cmd_gate.bool(),
+            torch.where(
+                right_backward_real_swing,
+                self._right_backward_swing_time + self.step_dt,
+                self._right_backward_swing_time,
+            ),
+            torch.zeros_like(self._right_backward_swing_time),
+        )
+
+        # ------------------------------------------------------------
+        # Jakość czasu swingu.
+        #
+        # 0.00 s -> 0
+        # 0.08 s -> maksimum
+        # potem reward wygasa
+        # 0.25 s -> 0
+        #
+        # Dzięki temu nie opłaca się ani drgać,
+        # ani wisieć wiecznie na jednej nodze.
+        # ------------------------------------------------------------
+
+        left_backward_time_rise = torch.clamp(
+            self._left_backward_swing_time
+            / self.cfg.backward_step_min_time,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_backward_time_rise = torch.clamp(
+            self._right_backward_swing_time
+            / self.cfg.backward_step_min_time,
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_time_span = (
+                self.cfg.backward_step_max_time
+                - self.cfg.backward_step_min_time
+        )
+
+        left_backward_time_fall = torch.clamp(
+            (
+                    self.cfg.backward_step_max_time
+                    - self._left_backward_swing_time
+            )
+            / backward_time_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_backward_time_fall = torch.clamp(
+            (
+                    self.cfg.backward_step_max_time
+                    - self._right_backward_swing_time
+            )
+            / backward_time_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        left_backward_swing_quality = (
+                left_backward_time_rise
+                * left_backward_time_fall
+        )
+
+        right_backward_swing_quality = (
+                right_backward_time_rise
+                * right_backward_time_fall
+        )
+
+        backward_real_single_support = (
+                left_backward_real_swing.float()
+                * left_backward_swing_quality
+
+                +
+
+                right_backward_real_swing.float()
+                * right_backward_swing_quality
+        )
+
         # ------------------------------------------------------------
         # CZAS SWING
         # ------------------------------------------------------------
@@ -1277,6 +2082,47 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             right_swing,
             self._right_swing_time + self.step_dt,
             self._right_swing_time,
+        )
+
+        # ============================================================
+        # BACKWARD SWING MATURITY GATE
+        #
+        # Mikro-swing nie może zgarniać pełnej nagrody za cofanie.
+        # Pełny reward dopiero przy swing >= swing_min_time.
+        # ============================================================
+
+        left_backward_swing_maturity = torch.clamp(
+            self._left_swing_time / self.cfg.swing_min_time,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_backward_swing_maturity = torch.clamp(
+            self._right_swing_time / self.cfg.swing_min_time,
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_swing_maturity = torch.maximum(
+            left_backward_swing_maturity,
+            right_backward_swing_maturity,
+        )
+
+        # backward_real_gait_gate = (
+        #         1.0
+        #         - backward_cmd_gate
+        #         + backward_cmd_gate
+        #         * (
+        #                 0.10
+        #                 + 0.90 * backward_swing_maturity
+        #         )
+        # )
+
+        backward_real_gait_gate = (
+                1.0
+                - backward_cmd_gate
+                + backward_cmd_gate
+                * torch.square(backward_swing_maturity)
         )
 
         # ------------------------------------------------------------
@@ -1324,6 +2170,19 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         )
 
         double_support = left_contact & right_contact
+
+        # ============================================================
+        # PRE-SWING: PRZENIESIENIE CIĘŻARU
+        #
+        # To jest mała pomoc do odkrycia single support.
+        # Nie może być głównym rewardem.
+        # ============================================================
+
+        backward_load_transfer = (
+                backward_cmd_gate
+                * double_support.float()
+                * load_transfer_shaped
+        )
 
         stand_double_contact = double_support.float()
 
@@ -1444,6 +2303,28 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             max=1.0,
         )
 
+        # ============================================================
+        # CZY BACKWARD JEST REALIZOWANY PRAWDZIWYM SWINGIEM
+        #
+        # Samo przesuwanie bazy przez drgania nie wystarcza.
+        # square() bardzo mocno obcina mikroruchy stopy.
+        # ============================================================
+
+        # backward_real_swing_quality = (
+        #         single_support.float()
+        #         * torch.square(swing_height_quality)
+        # )
+        #
+        # backward_real_step_gate = (
+        #         1.0
+        #         - backward_cmd_gate
+        #         + backward_cmd_gate
+        #         * (
+        #                 0.10
+        #                 + 0.90 * backward_real_swing_quality
+        #         )
+        # )
+
         left_time_gate = (
                 self._left_swing_time <= self.cfg.swing_max_time
         ).float()
@@ -1506,17 +2387,45 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         #         * right_swing_quality
         #         * right_time_gate
         # )
+        # swing_reward = (
+        #         left_swing.float()
+        #         * left_swing_quality
+        #         * left_time_gate
+        #
+        #         +
+        #
+        #         right_swing.float()
+        #         * right_swing_quality
+        #         * right_time_gate
+        # )
+
+        left_swing_air_gate = torch.where(
+            backward_cmd_gate.bool(),
+            left_bw_air_quality,
+            torch.ones_like(left_bw_air_quality),
+        )
+
+        right_swing_air_gate = torch.where(
+            backward_cmd_gate.bool(),
+            right_bw_air_quality,
+            torch.ones_like(right_bw_air_quality),
+        )
+
         swing_reward = (
                 left_swing.float()
                 * left_swing_quality
                 * left_time_gate
+                * left_swing_air_gate
 
                 +
 
                 right_swing.float()
                 * right_swing_quality
                 * right_time_gate
+                * right_swing_air_gate
         )
+
+
 
         # ------------------------------------------------------------
         # Razem:
@@ -1563,7 +2472,59 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         #         + 0.70 * motion_quality
         # )
 
-        swing_clearance_quality *= move_gate * gait_gate
+        # swing_clearance_quality *= move_gate * gait_gate * backward_motion_gate
+
+        # swing_clearance_quality *= (
+        #         move_gate
+        #         * gait_gate
+        #         * backward_motion_gate
+        #         * backward_swing_placement_gate
+        # )
+
+        # swing_clearance_quality *= (
+        #         move_gate
+        #         * gait_gate
+        #         * backward_gait_gate
+        # )
+        # ============================================================
+        # DENSE BACKWARD FOOT-PLACEMENT GATE
+        #
+        # Przy backward swing reward rośnie dopiero wtedy,
+        # gdy noga swing faktycznie idzie w stronę cofania.
+        #
+        # placement_quality:
+        #   0.5 -> stopy na podobnym X
+        #   >0.5 -> swing idzie w dobrym kierunku
+        #   <0.5 -> swing idzie w złą stronę
+        # ============================================================
+
+        backward_placement_progress = torch.clamp(
+            (active_swing_placement_quality - 0.5) / 0.5,
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_dense_placement_gate = (
+                1.0
+                - backward_cmd_gate
+                + backward_cmd_gate
+                * (
+                        0.15
+                        + 0.85 * backward_placement_progress
+                )
+        )
+
+        # swing_clearance_quality *= (
+        #         move_gate
+        #         * gait_gate
+        #         * backward_gait_gate
+        #         * backward_dense_placement_gate
+        # )
+
+        swing_clearance_quality *= (
+                move_gate
+                * gait_gate
+        )
         # Jakość faktycznej realizacji zadanej prędkości.
         # Używana tylko przy nagrodzie za UKOŃCZONY krok.
         locomotion_gate = track_lin_vel_xy
@@ -1580,6 +2541,496 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 right_contact
                 & (~self._prev_right_contact)
         )
+
+        # ============================================================
+        # BACKWARD - PRAWDZIWY FIRST CONTACT
+        # ============================================================
+
+        left_first_contact_bw = (
+            self._left_foot_contact.compute_first_contact(
+                self.step_dt
+            )[:, 0]
+        )
+
+        right_first_contact_bw = (
+            self._right_foot_contact.compute_first_contact(
+                self.step_dt
+            )[:, 0]
+        )
+
+        left_last_air_time_bw = (
+            self._left_foot_contact.data.last_air_time[:, 0]
+        )
+
+        right_last_air_time_bw = (
+            self._right_foot_contact.data.last_air_time[:, 0]
+        )
+        # ============================================================
+        # BACKWARD - KIERUNEK SWINGU I MIKROKROKU
+        #
+        # Nie gate'ujemy normalnego chodu.
+        # To są tylko DODATKOWE wskazówki:
+        #
+        #   swing foot ma iść W KIERUNKU KOMENDY
+        #   touchdown ma nastąpić choć trochę za nogą podporową
+        # ============================================================
+
+        placement_target = self.cfg.backward_step_placement_target
+
+        # ------------------------------------------------------------
+        # Placement podczas swingu.
+        #
+        # 0 mm   -> 0
+        # 5 mm   -> 0.25
+        # 10 mm  -> 0.50
+        # 20 mm  -> 1.00
+        # ------------------------------------------------------------
+
+        left_backward_placement_progress = torch.clamp(
+            left_placement_along_cmd / placement_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_backward_placement_progress = torch.clamp(
+            right_placement_along_cmd / placement_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        # Dense reward istnieje TYLKO gdy noga naprawdę jest swing.
+        # backward_swing_direction = (
+        #         backward_cmd_gate
+        #         * (
+        #                 left_swing.float()
+        #                 * left_backward_placement_progress
+        #
+        #                 +
+        #
+        #                 right_swing.float()
+        #                 * right_backward_placement_progress
+        #         )
+        # )
+
+        # ============================================================
+        # PRAWDZIWY BACKWARD SWING PROGRESS
+        #
+        # Mierzymy ruch TEJ SAMEJ stopy od miejsca liftoff.
+        # ============================================================
+
+        left_bw_delta_xy = (
+                left_foot_rel_heading[:, :2]
+                - self._left_bw_swing_start_xy
+        )
+
+        right_bw_delta_xy = (
+                right_foot_rel_heading[:, :2]
+                - self._right_bw_swing_start_xy
+        )
+
+        left_bw_displacement = torch.sum(
+            left_bw_delta_xy * cmd_dir,
+            dim=1,
+        )
+
+        right_bw_displacement = torch.sum(
+            right_bw_delta_xy * cmd_dir,
+            dim=1,
+        )
+
+        left_bw_displacement_quality = torch.clamp(
+            left_bw_displacement
+            / self.cfg.backward_step_placement_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_bw_displacement_quality = torch.clamp(
+            right_bw_displacement
+            / self.cfg.backward_step_placement_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        # backward_swing_direction = (
+        #         backward_cmd_gate
+        #         * (
+        #                 left_swing.float()
+        #                 * left_bw_air_quality
+        #                 * left_bw_displacement_quality
+        #
+        #                 +
+        #
+        #                 right_swing.float()
+        #                 * right_bw_air_quality
+        #                 * right_bw_displacement_quality
+        #         )
+        # )
+        # ============================================================
+        # BACKWARD - KTÓRA NOGA MA TERAZ IŚĆ?
+        # ============================================================
+
+        last_bw_dir_step = self._last_backward_directional_step.clone()
+
+        bw_expect_left = (
+                last_bw_dir_step == 1
+        )
+
+        bw_expect_right = (
+                last_bw_dir_step == -1
+        )
+
+        bw_no_previous_step = (
+                last_bw_dir_step == 0
+        )
+
+        # ------------------------------------------------------------
+        # Surowy prawdziwy swing każdej nogi.
+        # Nadal wymagamy:
+        # - realnego swingu,
+        # - air deadband,
+        # - przesunięcia TEJ SAMEJ stopy w kierunku cmd.
+        # ------------------------------------------------------------
+
+        left_backward_swing_raw = (
+                backward_cmd_gate
+                * left_backward_real_swing.float()
+                * left_bw_air_quality
+                * left_bw_displacement_quality
+        )
+
+        right_backward_swing_raw = (
+                backward_cmd_gate
+                * right_backward_real_swing.float()
+                * right_bw_air_quality
+                * right_bw_displacement_quality
+        )
+
+        # ------------------------------------------------------------
+        # WAGA STRONY
+        #
+        # brak poprzedniego kroku:
+        #   L = 1.0, R = 1.0
+        #
+        # ostatnia była PRAWA:
+        #   L = 1.5
+        #   R = 0.15
+        #
+        # ostatnia była LEWA:
+        #   R = 1.5
+        #   L = 0.15
+        # ------------------------------------------------------------
+
+        left_backward_swing_weight = torch.where(
+            bw_no_previous_step,
+            torch.ones_like(backward_cmd_gate),
+            torch.where(
+                bw_expect_left,
+                torch.full_like(
+                    backward_cmd_gate,
+                    self.cfg.backward_expected_swing_scale,
+                ),
+                torch.full_like(
+                    backward_cmd_gate,
+                    self.cfg.backward_repeat_swing_scale,
+                ),
+            ),
+        )
+
+        right_backward_swing_weight = torch.where(
+            bw_no_previous_step,
+            torch.ones_like(backward_cmd_gate),
+            torch.where(
+                bw_expect_right,
+                torch.full_like(
+                    backward_cmd_gate,
+                    self.cfg.backward_expected_swing_scale,
+                ),
+                torch.full_like(
+                    backward_cmd_gate,
+                    self.cfg.backward_repeat_swing_scale,
+                ),
+            ),
+        )
+
+        backward_swing_direction = (
+                left_backward_swing_raw
+                * left_backward_swing_weight
+
+                +
+
+                right_backward_swing_raw
+                * right_backward_swing_weight
+        )
+
+        # ------------------------------------------------------------
+        # BOOTSTRAP SŁABSZEJ NOGI
+        #
+        # Po prawdziwym kroku jednej nogi przeciwna dostaje reward
+        # już za PRAWDZIWE oderwanie i utrzymanie air-time.
+        #
+        # Nie wymaga jeszcze idealnego placementu.
+        # ------------------------------------------------------------
+
+        backward_expected_swing_lift = (
+                backward_cmd_gate
+                * (
+                        bw_expect_left.float()
+                        * left_backward_real_swing.float()
+                        * left_bw_air_quality
+
+                        +
+
+                        bw_expect_right.float()
+                        * right_backward_real_swing.float()
+                        * right_bw_air_quality
+                )
+        )
+
+
+
+        # ------------------------------------------------------------
+        # Jakość czasu w powietrzu przed touchdownem.
+        #
+        # Nie wymagamy twardo 0.08 s.
+        # Mikro-krok dostaje część rewardu.
+        # ------------------------------------------------------------
+
+        left_backward_air_quality = torch.clamp(
+            left_last_air_time_bw
+            / self.cfg.backward_step_air_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_backward_air_quality = torch.clamp(
+            right_last_air_time_bw
+            / self.cfg.backward_step_air_target,
+            min=0.0,
+            max=1.0,
+        )
+
+        # ------------------------------------------------------------
+        # TOUCHDOWN W DOBRYM KIERUNKU
+        #
+        # Nie ma:
+        # - minimum 1 cm clearance
+        # - minimum 5 mm placement
+        # - wymaganej alternacji
+        #
+        # Wszystko jest płynne.
+        # ------------------------------------------------------------
+
+        left_backward_directional_step = (
+                backward_cmd_gate
+                * left_first_contact_bw.float()
+                * right_contact.float()
+                * left_backward_air_quality
+                * left_backward_placement_progress
+        )
+
+        right_backward_directional_step = (
+                backward_cmd_gate
+                * right_first_contact_bw.float()
+                * left_contact.float()
+                * right_backward_air_quality
+                * right_backward_placement_progress
+        )
+
+        # backward_step_direction = (
+        #         left_backward_directional_step
+        #         + right_backward_directional_step
+        # )
+
+        left_last_air_quality = torch.clamp(
+            (
+                    left_last_air_time_bw
+                    - self.cfg.backward_air_deadband
+            ) / air_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        right_last_air_quality = torch.clamp(
+            (
+                    right_last_air_time_bw
+                    - self.cfg.backward_air_deadband
+            ) / air_span,
+            min=0.0,
+            max=1.0,
+        )
+
+        left_backward_directional_step = (
+                backward_cmd_gate
+                * left_first_contact_bw.float()
+                * right_contact.float()
+                * left_last_air_quality
+                * left_bw_displacement_quality
+                * left_bw_real_lift_seen.float()
+        )
+
+        right_backward_directional_step = (
+                backward_cmd_gate
+                * right_first_contact_bw.float()
+                * left_contact.float()
+                * right_last_air_quality
+                * right_bw_displacement_quality
+                * right_bw_real_lift_seen.float()
+        )
+
+        # backward_step_direction = (
+        #         left_backward_directional_step
+        #         + right_backward_directional_step
+        # )
+
+        # ============================================================
+        # DIRECTIONAL STEP - NAPRZEMIENNOŚĆ
+        # ============================================================
+
+        left_directional_allowed = (
+                last_bw_dir_step != -1
+        )
+
+        right_directional_allowed = (
+                last_bw_dir_step != 1
+        )
+
+        # Powtórzenie tej samej nogi:
+        # tylko 10% normalnego directional-step rewardu.
+        left_directional_step_weight = torch.where(
+            left_directional_allowed,
+            torch.ones_like(left_backward_directional_step),
+            torch.full_like(
+                left_backward_directional_step,
+                self.cfg.backward_repeat_step_scale,
+            ),
+        )
+
+        right_directional_step_weight = torch.where(
+            right_directional_allowed,
+            torch.ones_like(right_backward_directional_step),
+            torch.full_like(
+                right_backward_directional_step,
+                self.cfg.backward_repeat_step_scale,
+            ),
+        )
+
+        backward_step_direction = (
+                left_backward_directional_step
+                * left_directional_step_weight
+
+                +
+
+                right_backward_directional_step
+                * right_directional_step_weight
+        )
+
+        self._left_bw_real_lift_seen = torch.where(
+            backward_cmd_gate.bool() & (~left_first_contact_bw),
+            left_bw_real_lift_seen,
+            torch.zeros_like(self._left_bw_real_lift_seen),
+        )
+
+        self._right_bw_real_lift_seen = torch.where(
+            backward_cmd_gate.bool() & (~right_first_contact_bw),
+            right_bw_real_lift_seen,
+            torch.zeros_like(self._right_bw_real_lift_seen),
+        )
+
+        # ------------------------------------------------------------
+        # Eventy, które mogą przestawić kolej na drugą nogę.
+        # ------------------------------------------------------------
+
+        left_directional_accepted = (
+                (left_backward_directional_step > 0.0)
+                & left_directional_allowed
+        )
+
+        right_directional_accepted = (
+                (right_backward_directional_step > 0.0)
+                & right_directional_allowed
+        )
+
+        # Ile jakości kroku zostało odrzucone,
+        # bo policy próbowało drugi raz tej samej nogi.
+        backward_directional_repeat_debug = (
+                left_backward_directional_step
+                * (~left_directional_allowed).float()
+
+                +
+
+                right_backward_directional_step
+                * (~right_directional_allowed).float()
+        )
+
+        # Aktualizujemy kolej WYŁĄCZNIE prawdziwym directional touchdownem.
+        self._last_backward_directional_step = torch.where(
+            left_directional_accepted,
+            torch.full_like(
+                self._last_backward_directional_step,
+                -1,
+            ),
+            self._last_backward_directional_step,
+        )
+
+        self._last_backward_directional_step = torch.where(
+            right_directional_accepted,
+            torch.full_like(
+                self._last_backward_directional_step,
+                1,
+            ),
+            self._last_backward_directional_step,
+        )
+
+
+        left_backward_valid = (
+                backward_cmd_gate.bool()
+                & left_first_contact_bw
+                & right_contact
+                & (
+                        left_last_air_time_bw
+                        >= self.cfg.backward_step_min_time
+                )
+        )
+
+        right_backward_valid = (
+                backward_cmd_gate.bool()
+                & right_first_contact_bw
+                & left_contact
+                & (
+                        right_last_air_time_bw
+                        >= self.cfg.backward_step_min_time
+                )
+        )
+
+        # ============================================================
+        # JAKOŚĆ POŁOŻENIA STOPY W MOMENCIE TOUCHDOWNU
+        # ============================================================
+
+        touchdown_placement_quality = torch.clamp(
+            (
+                    left_touchdown.float()
+                    * left_placement_quality
+                    +
+                    right_touchdown.float()
+                    * right_placement_quality
+            ),
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_touchdown_placement_gate = (
+                1.0
+                - backward_cmd_gate
+                +
+                backward_cmd_gate
+                * (
+                        placement_floor
+                        + (1.0 - placement_floor)
+                        * touchdown_placement_quality
+                )
+        )
+
         left_valid_time = (
                 (self._left_swing_time >= self.cfg.swing_min_time)
                 &
@@ -1655,25 +3106,584 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 self._right_swing_time <= self.cfg.swing_max_time
         ).float()
 
-        left_step_complete = (
+        # left_step_complete = (
+        #         left_touchdown.float()
+        #         * left_step_time_quality
+        # )
+        #
+        # right_step_complete = (
+        #         right_touchdown.float()
+        #         * right_step_time_quality
+        # )
+
+        # ============================================================
+        # PRAWDZIWY KROK BACKWARD
+        #
+        # Forward zostawiamy dokładnie po staremu.
+        #
+        # Backward:
+        # - stopa musi naprawdę być w swing >= swing_min_time
+        # - nie może wisieć za długo
+        # - musi uzyskać rzeczywisty clearance
+        #
+        # square(clearance) mocno odcina mikro-drgania:
+        #  1 cm przy target 4 cm -> 0.0625
+        #  2 cm                 -> 0.25
+        #  3 cm                 -> 0.5625
+        #  4 cm                 -> 1.0
+        # ============================================================
+
+        # left_step_complete_normal = (
+        #         left_touchdown.float()
+        #         * left_step_time_quality
+        # )
+        #
+        # right_step_complete_normal = (
+        #         right_touchdown.float()
+        #         * right_step_time_quality
+        # )
+        #
+        # left_step_complete_backward = (
+        #         left_touchdown.float()
+        #         * left_valid_time.float()
+        #         * torch.square(left_step_clearance_quality)
+        # )
+        #
+        # right_step_complete_backward = (
+        #         right_touchdown.float()
+        #         * right_valid_time.float()
+        #         * torch.square(right_step_clearance_quality)
+        # )
+        #
+        # left_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     left_step_complete_backward,
+        #     left_step_complete_normal,
+        # )
+        #
+        # right_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     right_step_complete_backward,
+        #     right_step_complete_normal,
+        # )
+
+        # left_step_complete_normal = (
+        #         left_touchdown.float()
+        #         * left_step_time_quality
+        # )
+        #
+        # right_step_complete_normal = (
+        #         right_touchdown.float()
+        #         * right_step_time_quality
+        # )
+        #
+        # # Backward:
+        # # prawdziwy lift zwiększa wartość kroku,
+        # # ale brak idealnego liftu NIE zeruje rewardu.
+        # left_backward_clearance_gate = (
+        #         0.25
+        #         + 0.75 * left_step_clearance_quality
+        # )
+        #
+        # right_backward_clearance_gate = (
+        #         0.25
+        #         + 0.75 * right_step_clearance_quality
+        # )
+        #
+        # left_step_complete_backward = (
+        #         left_touchdown.float()
+        #         * left_step_time_quality
+        #         * left_backward_clearance_gate
+        # )
+        #
+        # right_step_complete_backward = (
+        #         right_touchdown.float()
+        #         * right_step_time_quality
+        #         * right_backward_clearance_gate
+        # )
+        #
+        # left_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     left_step_complete_backward,
+        #     left_step_complete_normal,
+        # )
+        #
+        # right_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     right_step_complete_backward,
+        #     right_step_complete_normal,
+        # )
+
+        # ============================================================
+        # PRAWDZIWY NAPRZEMIENNY KROK BACKWARD
+        #
+        # Forward pozostaje dokładnie po staremu.
+        #
+        # Backward dostaje step reward tylko gdy:
+        # 1. nastąpił touchdown,
+        # 2. swing trwał >= swing_min_time,
+        # 3. stopa uniosła się przynajmniej ~1 cm,
+        # 4. stopa została postawiona ZA nogą podporową,
+        # 5. nie jest to drugi raz z rzędu ta sama noga.
+        # ============================================================
+
+        left_step_complete_normal = (
                 left_touchdown.float()
                 * left_step_time_quality
         )
 
-        right_step_complete = (
+        right_step_complete_normal = (
                 right_touchdown.float()
                 * right_step_time_quality
         )
 
-        self._episode_sums["left_step_debug"] += left_step_complete
-        self._episode_sums["right_step_debug"] += right_step_complete
+        # ============================================================
+        # BACKWARD TOUCHDOWN
+        #
+        # Event istnieje TYLKO wtedy, gdy wcześniej istniał
+        # PRAWDZIWY geometryczny swing.
+        # ============================================================
+
+        left_backward_touchdown = (
+                backward_cmd_gate.bool()
+                & left_contact_bw
+                & right_contact_bw
+                & (self._left_backward_swing_time > 0.0)
+        )
+
+        right_backward_touchdown = (
+                backward_cmd_gate.bool()
+                & right_contact_bw
+                & left_contact_bw
+                & (self._right_backward_swing_time > 0.0)
+        )
+
+        left_backward_valid_time = (
+                (self._left_backward_swing_time >= self.cfg.backward_step_min_time)
+                & (self._left_backward_swing_time <= self.cfg.backward_step_max_time)
+        )
+
+        right_backward_valid_time = (
+                (self._right_backward_swing_time >= self.cfg.backward_step_min_time)
+                & (self._right_backward_swing_time <= self.cfg.backward_step_max_time)
+        )
+
+        left_backward_valid = (
+                left_backward_touchdown
+                & left_backward_valid_time
+        )
+
+        right_backward_valid = (
+                right_backward_touchdown
+                & right_backward_valid_time
+        )
+
+        # ============================================================
+        # KARA ZA REALNY, ALE ZA KRÓTKI KROK
+        # ============================================================
+
+        # left_backward_premature = (
+        #         left_backward_touchdown
+        #         & (
+        #                 self._left_backward_swing_time
+        #                 < self.cfg.backward_step_min_time
+        #         )
+        # )
+        #
+        # right_backward_premature = (
+        #         right_backward_touchdown
+        #         & (
+        #                 self._right_backward_swing_time
+        #                 < self.cfg.backward_step_min_time
+        #         )
+        # )
+        #
+        # backward_premature_touchdown = (
+        #         left_backward_premature.float()
+        #         + right_backward_premature.float()
+        # )
+
+        left_backward_premature = (
+                backward_cmd_gate.bool()
+                & left_first_contact_bw
+                & (left_last_air_time_bw > 0.0)
+                & (
+                        left_last_air_time_bw
+                        < self.cfg.backward_step_min_time
+                )
+        )
+
+        right_backward_premature = (
+                backward_cmd_gate.bool()
+                & right_first_contact_bw
+                & (right_last_air_time_bw > 0.0)
+                & (
+                        right_last_air_time_bw
+                        < self.cfg.backward_step_min_time
+                )
+        )
+
+        backward_premature_touchdown = (
+                left_backward_premature.float()
+                + right_backward_premature.float()
+        )
+
+        # ============================================================
+        # ALTERNACJA
+        # ============================================================
+
+        left_allowed = (
+                self._last_backward_step != -1
+        )
+
+        right_allowed = (
+                self._last_backward_step != 1
+        )
+
+        left_backward_accepted = (
+                left_backward_valid
+                & left_allowed
+        )
+
+        right_backward_accepted = (
+                right_backward_valid
+                & right_allowed
+        )
+
+        backward_repeat_reject = (
+                (
+                        left_backward_valid
+                        & (~left_allowed)
+                )
+                |
+                (
+                        right_backward_valid
+                        & (~right_allowed)
+                )
+        ).float()
+
+        backward_alt_step = (
+                left_backward_accepted.float()
+                + right_backward_accepted.float()
+        )
+
+        self._last_backward_step = torch.where(
+            left_backward_accepted,
+            torch.full_like(self._last_backward_step, -1),
+            self._last_backward_step,
+        )
+
+        self._last_backward_step = torch.where(
+            right_backward_accepted,
+            torch.full_like(self._last_backward_step, 1),
+            self._last_backward_step,
+        )
+
+        # # ============================================================
+        # # STARY STEP_COMPLETE ZOSTAJE TYLKO DLA FORWARD
+        # # ============================================================
+        #
+        # non_backward_gate = (
+        #         1.0 - backward_cmd_gate
+        # )
+        #
+        # step_complete = (
+        #                         left_step_complete_normal
+        #                         + right_step_complete_normal
+        #                 ) * (
+        #                         move_gate
+        #                         * step_direction_gate
+        #                         * knee_step_gate
+        #                         * non_backward_gate
+        #                 )
+        #
+        # self._episode_sums["left_step_debug"] += (
+        #         left_step_complete_normal
+        #         * non_backward_gate
+        # )
+        #
+        # self._episode_sums["right_step_debug"] += (
+        #         right_step_complete_normal
+        #         * non_backward_gate
+        # )
+        #
+        # # ------------------------------------------------------------
+        # # Minimalne kryteria prawdziwego kroku.
+        # # ------------------------------------------------------------
+        #
+        # backward_min_clearance = 0.010  # 1 cm
+        # backward_min_placement = 0.005  # 5 mm za podporową
+        #
+        # left_backward_valid = (
+        #         backward_cmd_gate.bool()
+        #         & left_touchdown
+        #         & (~right_touchdown)
+        #         & left_valid_time
+        #         & (self._left_max_clearance >= backward_min_clearance)
+        #         & (left_placement_along_cmd >= backward_min_placement)
+        # )
+        #
+        # right_backward_valid = (
+        #         backward_cmd_gate.bool()
+        #         & right_touchdown
+        #         & (~left_touchdown)
+        #         & right_valid_time
+        #         & (self._right_max_clearance >= backward_min_clearance)
+        #         & (right_placement_along_cmd >= backward_min_placement)
+        # )
+        #
+        # # ------------------------------------------------------------
+        # # Alternacja.
+        # #
+        # # Jeśli ostatnia była LEWA (-1), teraz wolno nagrodzić tylko PRAWĄ.
+        # # Jeśli ostatnia była PRAWA (+1), teraz tylko LEWĄ.
+        # # Przy 0 pierwsza noga może być dowolna.
+        # # ------------------------------------------------------------
+        #
+        # left_allowed = (
+        #         self._last_backward_step != -1
+        # )
+        #
+        # right_allowed = (
+        #         self._last_backward_step != 1
+        # )
+        #
+        # left_backward_accepted = (
+        #         left_backward_valid
+        #         & left_allowed
+        # )
+        #
+        # right_backward_accepted = (
+        #         right_backward_valid
+        #         & right_allowed
+        # )
+        #
+        # # ------------------------------------------------------------
+        # # Jakość poprawnego touchdownu.
+        # #
+        # # Bez square().
+        # # Mamy już twarde minimum czasu/clearance/placement,
+        # # więc teraz jakość może być płynna.
+        # # ------------------------------------------------------------
+        #
+        # left_backward_step_quality = (
+        #         left_backward_accepted.float()
+        #         * left_step_clearance_quality
+        #         * left_placement_quality
+        # )
+        #
+        # right_backward_step_quality = (
+        #         right_backward_accepted.float()
+        #         * right_step_clearance_quality
+        #         * right_placement_quality
+        # )
+        #
+        # backward_alt_step = (
+        #         left_backward_step_quality
+        #         + right_backward_step_quality
+        # )
+        #
+        # # ------------------------------------------------------------
+        # # DEBUG: próba powtórzenia tej samej nogi.
+        # # ------------------------------------------------------------
+        #
+        # backward_repeat_reject = (
+        #         (
+        #                 left_backward_valid
+        #                 & (~left_allowed)
+        #         )
+        #         |
+        #         (
+        #                 right_backward_valid
+        #                 & (~right_allowed)
+        #         )
+        # ).float()
+        #
+        # # ------------------------------------------------------------
+        # # Aktualizacja pamięci TYLKO po zaakceptowanym kroku.
+        # # ------------------------------------------------------------
+        #
+        # self._last_backward_step = torch.where(
+        #     left_backward_accepted,
+        #     torch.full_like(
+        #         self._last_backward_step,
+        #         -1,
+        #     ),
+        #     self._last_backward_step,
+        # )
+        #
+        # self._last_backward_step = torch.where(
+        #     right_backward_accepted,
+        #     torch.full_like(
+        #         self._last_backward_step,
+        #         1,
+        #     ),
+        #     self._last_backward_step,
+        # )
+        #
+        # # ------------------------------------------------------------
+        # # Dla backward podstawowym step_complete staje się właśnie
+        # # naprzemienny, poprawnie postawiony krok.
+        # #
+        # # Forward = stary reward bez zmian.
+        # # ------------------------------------------------------------
+        #
+        # left_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     left_backward_step_quality,
+        #     left_step_complete_normal,
+        # )
+        #
+        # right_step_complete = torch.where(
+        #     backward_cmd_gate.bool(),
+        #     right_backward_step_quality,
+        #     right_step_complete_normal,
+        # )
+        #
+        # self._episode_sums["left_step_debug"] += left_step_complete
+        # self._episode_sums["right_step_debug"] += right_step_complete
+        #
+        # step_complete = (
+        #                         left_step_complete
+        #                         + right_step_complete
+        #                 ) * (
+        #                         move_gate
+        #                         * step_direction_gate
+        #                         * knee_step_gate
+        #                         * backward_gait_gate
+        #                 )
+        #
+
+        # self._episode_sums["left_step_debug"] += left_step_complete
+        # self._episode_sums["right_step_debug"] += right_step_complete
 
         # Krok ma uczyć samej mechaniki chodu.
         # Kierunek, yaw i prędkość mają własne rewardy.
+        # step_complete = (
+        #                         left_step_complete
+        #                         + right_step_complete
+        #                 ) * move_gate * step_direction_gate * knee_step_gate *backward_motion_gate
+
+        # step_complete = (
+        #         left_step_complete
+        #         + right_step_complete
+        # ) * (
+        #         move_gate
+        #         * step_direction_gate
+        #         * knee_step_gate
+        #         * backward_motion_gate
+        #         * backward_touchdown_placement_gate
+        # )
+
+        # ============================================================
+        # BACKWARD REAL STEP
+        #
+        # Mikrodrygnięcie:
+        #   krótki czas * mały clearance -> prawie 0 rewardu
+        #
+        # Normalny krok:
+        #   długi swing * sensowne uniesienie -> duży reward
+        #
+        # To jest DODATKOWY reward.
+        # NIE gate'ujemy nim velocity/progress.
+        # ============================================================
+
+        # left_backward_real_step = (
+        #         left_touchdown.float()
+        #         * torch.square(left_step_time_quality)
+        #         * torch.square(left_step_clearance_quality)
+        # )
+        #
+        # right_backward_real_step = (
+        #         right_touchdown.float()
+        #         * torch.square(right_step_time_quality)
+        #         * torch.square(right_step_clearance_quality)
+        # )
+        #
+        # backward_real_step = (
+        #                              left_backward_real_step
+        #                              + right_backward_real_step
+        #                      ) * backward_cmd_gate
+        #
+        #
+        # step_complete = (
+        #                         left_step_complete
+        #                         + right_step_complete
+        #                 ) * (
+        #                         move_gate
+        #                         * step_direction_gate
+        #                         * knee_step_gate
+        #                         * backward_gait_gate
+        #                 )
+
+        # ============================================================
+        # UNIFIED STEP COMPLETE
+        #
+        # Forward i backward korzystają z TEJ SAMEJ
+        # mechaniki kroku.
+        #
+        # Kierunek backward ma osobny, miękki reward.
+        # ============================================================
+
+        non_backward_gate = (
+                1.0 - backward_cmd_gate
+        )
+
+        # Forward dostaje 100% progress.
+        # Backward na początku tylko 25%.
+        backward_progress_reward_gate = (
+                1.0
+                - backward_cmd_gate
+                + backward_cmd_gate
+                * self.cfg.backward_progress_scale
+        )
+
+        # Podstawowy mechanizm touchdownu IDENTYCZNY
+        # dla obu kierunków.
+        # left_step_complete = left_step_complete_normal
+        # right_step_complete = right_step_complete_normal
+
+        left_step_complete_backward = (
+                left_first_contact_bw.float()
+                * left_last_air_quality
+        )
+
+        right_step_complete_backward = (
+                right_first_contact_bw.float()
+                * right_last_air_quality
+        )
+
+        left_step_complete = torch.where(
+            backward_cmd_gate.bool(),
+            left_step_complete_backward,
+            left_step_complete_normal,
+        )
+
+        right_step_complete = torch.where(
+            backward_cmd_gate.bool(),
+            right_step_complete_backward,
+            right_step_complete_normal,
+        )
+
+
+
+        self._episode_sums["left_step_debug"] += (
+            left_step_complete
+        )
+
+        self._episode_sums["right_step_debug"] += (
+            right_step_complete
+        )
+
         step_complete = (
                                 left_step_complete
                                 + right_step_complete
-                        ) * move_gate * step_direction_gate * knee_step_gate *backward_motion_gate
+                        ) * (
+                                move_gate
+                                * step_direction_gate
+                                * knee_step_gate
+                        )
+
         # self._episode_sums["left_step_debug"] += left_step_complete
         # self._episode_sums["right_step_debug"] += right_step_complete
         # step_motion_gate = (
@@ -1824,6 +3834,92 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             + right_contact.float() * torch.sum(torch.square(vel_r_xy), dim=1)
         )
         # ============================================================
+        # BACKWARD CONTACT SLIP
+        #
+        # Tutaj używamy NORMY, nie kwadratu.
+        # Ma być wyraźnie drogo przesuwać stopę po ziemi.
+        # ============================================================
+
+        backward_contact_slip = (
+                backward_cmd_gate
+                * (
+                        left_contact_bw.float()
+                        * torch.norm(vel_l_xy, dim=1)
+
+                        +
+
+                        right_contact_bw.float()
+                        * torch.norm(vel_r_xy, dim=1)
+                )
+        )
+
+        # ============================================================
+        # EXPECTED FOOT SLIP
+        #
+        # Jeżeli po kroku prawej kolej jest na lewą,
+        # a LEWA zamiast się oderwać jedzie po ziemi -> dodatkowa kara.
+        #
+        # Analogicznie w drugą stronę.
+        # ============================================================
+
+        bw_expect_left_now = (
+                self._last_backward_directional_step == 1
+        )
+
+        bw_expect_right_now = (
+                self._last_backward_directional_step == -1
+        )
+
+        backward_expected_foot_slip = (
+                backward_cmd_gate
+                * (
+                        bw_expect_left_now.float()
+                        * left_contact_bw.float()
+                        * torch.norm(vel_l_xy, dim=1)
+
+                        +
+
+                        bw_expect_right_now.float()
+                        * right_contact_bw.float()
+                        * torch.norm(vel_r_xy, dim=1)
+                )
+        )
+
+
+        # ============================================================
+        # BACKWARD SHUFFLE
+        #
+        # Krótki double-support jest OK.
+        # Jazda bazą do tyłu przy >0.10 s double-support = kara.
+        # ============================================================
+
+        backward_long_double_support = torch.clamp(
+            (
+                    self._backward_double_support_time
+                    - self.cfg.backward_shuffle_grace
+            )
+            / (
+                    self.cfg.backward_shuffle_full
+                    - self.cfg.backward_shuffle_grace
+            ),
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_shuffle_speed_ratio = torch.clamp(
+            backward_signed_speed
+            / backward_target_speed,
+            min=0.0,
+            max=1.0,
+        )
+
+        backward_shuffle = (
+                backward_cmd_gate
+                * backward_long_double_support
+                * torch.square(backward_shuffle_speed_ratio)
+        )
+
+        # ============================================================
         # RESET HISTORII PO TOUCHDOWN
         # ============================================================
 
@@ -1837,6 +3933,18 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             right_touchdown,
             torch.zeros_like(self._right_swing_time),
             self._right_swing_time,
+        )
+
+        self._left_backward_swing_time = torch.where(
+            left_backward_touchdown,
+            torch.zeros_like(self._left_backward_swing_time),
+            self._left_backward_swing_time,
+        )
+
+        self._right_backward_swing_time = torch.where(
+            right_backward_touchdown,
+            torch.zeros_like(self._right_backward_swing_time),
+            self._right_backward_swing_time,
         )
 
         self._left_max_clearance = torch.where(
@@ -2000,9 +4108,14 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 + 0.65 * backward_speed_ratio
         )
 
-        backward_velocity_error = (
-                                          forward_vel - self._commands[:, 0]
-                                  ) ** 2
+        # backward_velocity_error = (
+        #                                   forward_vel - self._commands[:, 0]
+        #                           ) ** 2
+
+        backward_velocity_error = torch.square(
+            self._backward_vel_ema
+            - backward_target_speed
+        )
 
         backward_track_quality = (
                 torch.exp(
@@ -2010,6 +4123,171 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     / self.cfg.backward_tracking_sigma
                 )
                 * backward_cmd_gate
+        )
+        # backward_long_double_support = torch.clamp(
+        #     (
+        #             self._double_support_time
+        #             - self.cfg.backward_double_support_grace
+        #     )
+        #     / (
+        #             self.cfg.backward_double_support_full
+        #             - self.cfg.backward_double_support_grace
+        #     ),
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # backward_speed_ratio_for_shuffle = torch.clamp(
+        #     backward_speed / backward_target_speed,
+        #     min=0.0,
+        #     max=1.0,
+        # )
+        #
+        # backward_shuffle = (
+        #         backward_cmd_gate
+        #         * backward_long_double_support
+        #         * backward_speed_ratio_for_shuffle
+        # )
+
+        # backward_touchdown_candidate = (
+        #         backward_cmd_gate.bool()
+        #         & (
+        #                 (left_touchdown & (~right_touchdown))
+        #                 | (right_touchdown & (~left_touchdown))
+        #         )
+        # )
+        #
+        # backward_time_valid = (
+        #                               (
+        #                                       left_touchdown
+        #                                       & left_valid_time
+        #                               )
+        #                               |
+        #                               (
+        #                                       right_touchdown
+        #                                       & right_valid_time
+        #                               )
+        #                       ) & backward_cmd_gate.bool()
+        #
+        # backward_clearance_valid = (
+        #                                    (
+        #                                            left_touchdown
+        #                                            & (self._left_max_clearance >= backward_min_clearance)
+        #                                    )
+        #                                    |
+        #                                    (
+        #                                            right_touchdown
+        #                                            & (self._right_max_clearance >= backward_min_clearance)
+        #                                    )
+        #                            ) & backward_cmd_gate.bool()
+        #
+        # backward_placement_valid = (
+        #                                    (
+        #                                            left_touchdown
+        #                                            & (left_placement_along_cmd >= backward_min_placement)
+        #                                    )
+        #                                    |
+        #                                    (
+        #                                            right_touchdown
+        #                                            & (right_placement_along_cmd >= backward_min_placement)
+        #                                    )
+        #                            ) & backward_cmd_gate.bool()
+        #
+        # self._episode_sums["backward_touchdown_debug"] += (
+        #     backward_touchdown_candidate.float()
+        # )
+        #
+        # self._episode_sums["backward_time_valid_debug"] += (
+        #     backward_time_valid.float()
+        # )
+        #
+        # self._episode_sums["backward_clearance_valid_debug"] += (
+        #     backward_clearance_valid.float()
+        # )
+        #
+        # self._episode_sums["backward_placement_valid_debug"] += (
+        #     backward_placement_valid.float()
+        # )
+
+        # ============================================================
+        # BACKWARD STRAIGHTNESS
+        #
+        # Nie jest to osobny reward.
+        # To gate dla istniejących backward gait rewards.
+        #
+        # vel_cross_cmd:
+        #   0 = ruch dokładnie po osi komendy
+        #
+        # yaw_rate:
+        #   0 = brak zakręcania
+        # ============================================================
+
+        backward_straight_lateral_factor = torch.exp(
+            -torch.square(
+                vel_cross_cmd
+                / self.cfg.backward_straight_lateral_sigma
+            )
+        )
+
+        backward_straight_yaw_factor = torch.exp(
+            -torch.square(
+                yaw_rate
+                / self.cfg.backward_straight_yaw_sigma
+            )
+        )
+
+        backward_straightness_gate = (
+                backward_straight_lateral_factor
+                * backward_straight_yaw_factor
+        )
+
+        # Dense swing reward ma łagodniejszy floor.
+        # Nie chcemy stracić odkrytego mechanizmu swingu.
+        backward_swing_straight_gate = (
+                self.cfg.backward_swing_straightness_floor
+                + (
+                        1.0
+                        - self.cfg.backward_swing_straightness_floor
+                )
+                * backward_straightness_gate
+        )
+
+        # Touchdown / ukończony krok ma być dużo bardziej wymagający.
+        backward_step_straight_gate = (
+                self.cfg.backward_step_straightness_floor
+                + (
+                        1.0
+                        - self.cfg.backward_step_straightness_floor
+                )
+                * backward_straightness_gate
+        )
+
+        backward_touchdown_candidate = (
+                left_backward_touchdown
+                | right_backward_touchdown
+        )
+
+        backward_time_valid = (
+                left_backward_valid
+                | right_backward_valid
+        )
+
+        self._episode_sums["backward_touchdown_debug"] += (
+            backward_touchdown_candidate.float()
+        )
+
+        self._episode_sums["backward_time_valid_debug"] += (
+            backward_time_valid.float()
+        )
+
+        self._episode_sums["backward_real_left_swing_debug"] += (
+                left_backward_real_swing.float()
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_real_right_swing_debug"] += (
+                right_backward_real_swing.float()
+                * self.step_dt
         )
 
         self._episode_sums["stand_left_foot_tilt_deg_debug"] += (
@@ -2039,6 +4317,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 self.cfg.rew_scale_track_lin_vel_xy
                 * track_lin_vel_xy
                 * support_reward_gate
+                * non_backward_gate
                 * dt
             ),
             "track_yaw_vel": (
@@ -2093,6 +4372,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * progress_gate
                 * bias_progress_gate
                 * roll_progress_gate
+                * backward_progress_reward_gate
                 * self.step_dt,
             "swing_knee_flex": (
                     self.cfg.rew_scale_swing_knee_flex
@@ -2160,7 +4440,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     self.cfg.rew_scale_knee_pair_use
                     * knee_pair_quality
                     * move_gate
-                    * backward_motion_gate
                     * dt
             ),
             "roll_bias": (
@@ -2274,6 +4553,129 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     self.cfg.rew_scale_backward_track
                     * backward_track_quality
                     * upright_gate
+                    * self.step_dt
+            ),
+            "backward_signed_progress": (
+                    self.cfg.rew_scale_backward_signed_progress
+                    * backward_signed_progress
+                    * upright_gate
+                    * self.step_dt
+            ),
+            # "backward_real_step": (
+            #         self.cfg.rew_scale_backward_real_step
+            #         * backward_real_step
+            #         * upright_gate
+            # ),
+            #
+            # "backward_shuffle": (
+            #         self.cfg.rew_scale_backward_shuffle
+            #         * backward_shuffle
+            #         * self.step_dt
+            # ),
+
+            # "backward_alt_step": (
+            #         20.0
+            #         * backward_alt_step
+            #         * upright_gate
+            # ),
+            # "backward_swing_discovery": (
+            #         12.0
+            #         * backward_swing_discovery
+            #         * upright_gate
+            #         * self.step_dt
+            # ),
+            # "backward_real_single_support": (
+            #         self.cfg.rew_scale_backward_single_support
+            #         * backward_real_single_support
+            #         * upright_gate
+            #         * self.step_dt
+            # ),
+            #
+            # "backward_alt_step": (
+            #         self.cfg.rew_scale_backward_alt_step
+            #         * backward_alt_step
+            #         * upright_gate
+            # ),
+            #
+            # "backward_premature_touchdown": (
+            #         self.cfg.rew_scale_backward_premature_touchdown
+            #         * backward_premature_touchdown
+            # ),
+
+            "backward_contact_slip": (
+                    self.cfg.rew_scale_backward_contact_slip
+                    * backward_contact_slip
+                    * self.step_dt
+            ),
+
+            "backward_shuffle": (
+                    self.cfg.rew_scale_backward_shuffle
+                    * backward_shuffle
+                    * self.step_dt
+            ),
+
+            "backward_load_transfer": (
+                    self.cfg.rew_scale_backward_load_transfer
+                    * backward_load_transfer
+                    * self.step_dt
+            ),
+
+            "backward_real_single_support": (
+                    self.cfg.rew_scale_backward_single_support
+                    * backward_single_stance_quality
+                    * upright_gate
+                    * self.step_dt
+            ),
+
+            "backward_alt_step": (
+                    self.cfg.rew_scale_backward_alt_step
+                    * backward_alt_step
+                    * upright_gate
+            ),
+
+            "backward_premature_touchdown": (
+                    self.cfg.rew_scale_backward_premature_touchdown
+                    * backward_premature_touchdown
+            ),
+            "backward_swing_direction": (
+                    self.cfg.rew_scale_backward_swing_direction
+                    * backward_swing_direction
+                    * backward_swing_straight_gate
+                    * upright_gate
+                    * self.step_dt
+            ),
+
+            "backward_step_direction": (
+                    self.cfg.rew_scale_backward_step_direction
+                    * backward_step_direction
+                    * backward_swing_straight_gate
+                    * upright_gate
+            ),
+
+            "backward_expected_swing_lift": (
+                    self.cfg.rew_scale_backward_expected_swing_lift
+                    * backward_expected_swing_lift
+                    * upright_gate
+                    * self.step_dt
+            ),
+
+            "backward_expected_foot_slip": (
+                    self.cfg.rew_scale_backward_expected_foot_slip
+                    * backward_expected_foot_slip
+                    * self.step_dt
+            ),
+            "backward_real_pair_use": (
+                    self.cfg.rew_scale_backward_real_pair_use
+                    * backward_real_pair_quality
+                    * backward_cmd_gate
+                    * upright_gate
+                    * self.step_dt
+            ),
+
+            "backward_real_swing_balance": (
+                    self.cfg.rew_scale_backward_real_swing_balance
+                    * backward_real_swing_balance_error
+                    * backward_cmd_gate
                     * self.step_dt
             ),
 
@@ -2558,6 +4960,80 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * forward_cmd_gate
                 * self.step_dt
         )
+
+        backward_active_swing = (
+                backward_cmd_gate
+                * single_support.float()
+        )
+
+        self._episode_sums["backward_foot_placement_debug"] += (
+                active_swing_placement_quality
+                * backward_active_swing
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_foot_placement_gate_debug"] += (
+                backward_swing_placement_gate
+                * backward_active_swing
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_left_alt_step_debug"] += (
+            left_backward_accepted.float()
+        )
+
+        self._episode_sums["backward_right_alt_step_debug"] += (
+            right_backward_accepted.float()
+        )
+
+        self._episode_sums["backward_repeat_reject_debug"] += (
+            backward_repeat_reject
+        )
+
+        self._episode_sums["backward_yaw_rate_debug"] += (
+                torch.abs(yaw_rate)
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_straightness_gate_debug"] += (
+                backward_straightness_gate
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_straight_lateral_factor_debug"] += (
+                backward_straight_lateral_factor
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_straight_yaw_factor_debug"] += (
+                backward_straight_yaw_factor
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_left_directional_step_debug"] += (
+            left_backward_directional_step
+        )
+
+        self._episode_sums["backward_right_directional_step_debug"] += (
+            right_backward_directional_step
+        )
+
+        self._episode_sums["backward_directional_repeat_debug"] += (
+            backward_directional_repeat_debug
+        )
+
+        self._episode_sums["backward_left_real_use_debug"] += (
+                left_bw_real_use * backward_cmd_gate * self.step_dt
+        )
+
+        self._episode_sums["backward_right_real_use_debug"] += (
+                right_bw_real_use * backward_cmd_gate * self.step_dt
+        )
+
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2626,6 +5102,24 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._prev_right_contact[env_ids] = True
         self._roll_ema[env_ids] = 0.0
         # self._last_rewarded_step[env_ids] = 0
+
+        self._backward_vel_ema[env_ids] = 0.0
+
+        self._left_bw_swing_start_xy[env_ids] = 0.0
+        self._right_bw_swing_start_xy[env_ids] = 0.0
+
+        self._last_backward_directional_step[env_ids] = 0
+
+        self._last_backward_step[env_ids] = 0
+        self._left_backward_swing_time[env_ids] = 0.0
+        self._right_backward_swing_time[env_ids] = 0.0
+        self._backward_double_support_time[env_ids] = 0.0
+
+        self._left_bw_real_swing_ema[env_ids] = 0.0
+        self._right_bw_real_swing_ema[env_ids] = 0.0
+
+        self._left_bw_real_lift_seen[env_ids] = False
+        self._right_bw_real_lift_seen[env_ids] = False
 
         extras = {}
         for key in self._episode_sums.keys():

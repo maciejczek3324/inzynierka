@@ -89,7 +89,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     left_foot_contact = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Robot/porzadki_skrecajacy_urdf_export/stopaL_1",
         update_period=0.0,
-        history_length=2,
+        history_length=3,
         track_air_time=True,
         force_threshold=1.0,
         debug_vis=False,
@@ -98,7 +98,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     right_foot_contact = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Robot/porzadki_skrecajacy_urdf_export/stopaR_1",
         update_period=0.0,
-        history_length=2,
+        history_length=3,
         track_air_time=True,
         force_threshold=1.0,
         debug_vis=False,
@@ -115,7 +115,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Cały reward i obserwacje są już 2D+yaw, więc później zmieniasz tylko
     # command_mode na "omni" bez przebudowy sieci.
     command_mode = "forward_backward"
-    forward_command_x = -0.06 #docelowo 0.12
+    forward_command_x = -0.02 #docelowo 0.12
 
     # TRAINING: losowana prędkość do przodu.
     # forward_command_min = 0.08
@@ -128,7 +128,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     forward_command_max = 0.15
 
     # 15% wylosowanych komend = stanie w miejscu.
-    standing_command_probability = 0.25
+    standing_command_probability = 0.10
     command_resample_time_s = 10
 
     # Gotowe zakresy na późniejszy etap omnidirectional.
@@ -265,15 +265,226 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     stand_foot_flat_deadband_deg = 4.0
     rew_scale_stand_foot_flat = -15.0
 
-    backward_command_min = 0.03
-    backward_command_max = 0.06
+    # backward_command_min = 0.04
+    # backward_command_max = 0.04
+    #
+    # # Spośród KOMEND RUCHU 1/3 będzie do tyłu.
+    # # Przy stand=25% daje około:
+    # # 25% stand
+    # # 25% backward
+    # # 50% forward
+    # backward_probability = 0.90
+    # rew_scale_backward_discovery = 0.0
+    # # rew_scale_backward_track = 10.0
+    # # backward_tracking_sigma = 0.003
+    #
+    # command_move_threshold = 0.01
+    #
+    # rew_scale_backward_signed_progress = 0.0
+    #
+    # backward_velocity_ema_alpha = 0.05
+    #
+    # rew_scale_backward_track = 0.0
+    # backward_tracking_sigma = 0.0006
+    #
+    # backward_foot_placement_sigma = 0.015
+    # backward_foot_placement_floor = 0.25
+    # # NOWE: prawdziwy krok.
+    # rew_scale_backward_real_step = 30.0
+    #
+    # # NOWE: nie wolno zdobywać cofania przez telepanie na 2 stopach.
+    # rew_scale_backward_shuffle = -8.0
+    #
+    # backward_double_support_grace = 0.10
+    # backward_double_support_full = 0.35
 
-    # Spośród KOMEND RUCHU 1/3 będzie do tyłu.
-    # Przy stand=25% daje około:
-    # 25% stand
-    # 25% backward
-    # 50% forward
-    backward_probability = 2.0 / 3.0
-    rew_scale_backward_discovery = 25.0
-    rew_scale_backward_track = 10.0
-    backward_tracking_sigma = 0.003
+    # # ============================================================
+    # # BACKWARD - STAGE 1: NAUKA PRAWDZIWEGO KROKU
+    # # ============================================================
+    #
+    # backward_command_min = 0.04
+    # backward_command_max = 0.04
+    #
+    # backward_probability = 0.80
+    #
+    # command_move_threshold = 0.01
+    #
+    # # Na STAGE 1 NIE płacimy za prędkość do tyłu.
+    # rew_scale_backward_discovery = 0.0
+    # rew_scale_backward_signed_progress = 0.0
+    # rew_scale_backward_track = 0.0
+    #
+    # backward_velocity_ema_alpha = 0.05
+    # backward_tracking_sigma = 0.0006
+    #
+    # # Prawdziwy swing:
+    # # brak kontaktu + druga noga podpiera + min. 4 mm fizycznego liftu.
+    # backward_real_lift_min = 0.004
+    #
+    # # Małe kroki do tyłu.
+    # backward_step_min_time = 0.08
+    # backward_step_max_time = 0.25
+    #
+    # # Ile nagradzamy sam REALNY single support.
+    # rew_scale_backward_single_support = 8
+    #
+    # # Główna nagroda za prawidłowy naprzemienny krok.
+    # rew_scale_backward_alt_step = 12.0
+    #
+    # # Kara za realny, ale za krótki mikrokrok.
+    # rew_scale_backward_premature_touchdown = -0.5
+    #
+    # # Kara za przesuwanie stopy będącej na ziemi.
+    # rew_scale_backward_contact_slip = -4.0
+    #
+    # # Kara za jazdę bazą do tyłu przy długim double-support.
+    # rew_scale_backward_shuffle = -4.0
+    #
+    # backward_shuffle_grace = 0.10
+    # backward_shuffle_full = 0.25
+    #
+    # # ============================================================
+    # # BACKWARD STAGE 1 - MAŁE NORMALNE KROKI
+    # # ============================================================
+    #
+    # # Oficjalny-style biped single stance.
+    # backward_air_time_target = 0.10
+    #
+    # # Mała marchewka za odciążenie jednej nogi.
+    # rew_scale_backward_load_transfer = 0.75
+    #
+    # ============================================================
+    # BACKWARD CURRICULUM V1
+    # Zachowujemy działający gait forward i uczymy go
+    # stopniowo dla małych ujemnych komend.
+    # ============================================================
+
+    # Pierwszy etap: naprawdę małe cofanie.
+    # command_move_threshold = 0.01, więc nie schodzimy do 0.01.
+    backward_command_min = 0.015
+    backward_command_max = 0.025
+
+    # 10% stand zostaje.
+    # Z pozostałych 90%:
+    # ~45% forward
+    # ~45% backward
+    backward_probability = 0.50
+
+    command_move_threshold = 0.01
+
+    # Stare backward velocity rewards na razie wyłączone.
+    # Kierunek daje nam command-relative progress.
+    rew_scale_backward_discovery = 0.0
+    rew_scale_backward_signed_progress = 0.0
+    rew_scale_backward_track = 0.0
+
+    backward_velocity_ema_alpha = 0.05
+    backward_tracking_sigma = 0.0006
+
+    # Nadal używane przez istniejące obliczenia/debug.
+    backward_foot_placement_sigma = 0.015
+    backward_foot_placement_floor = 0.25
+
+    # Stare eksperymentalne rewardy WYŁĄCZONE.
+    # Kod może sobie na razie istnieć, ale nie steruje uczeniem.
+    backward_real_lift_min = 0.004
+    backward_step_min_time = 0.08
+    backward_step_max_time = 0.25
+    backward_air_time_target = 0.10
+
+    rew_scale_backward_single_support = 0.0
+    rew_scale_backward_alt_step = 0.0
+    rew_scale_backward_premature_touchdown = 0.0
+    rew_scale_backward_load_transfer = 0.0
+
+    # ------------------------------------------------------------
+    # NOWY CURRICULUM
+    # ------------------------------------------------------------
+
+    # Backward dostaje na początek tylko 25% normalnego
+    # rewardu za postęp bazy.
+    # Forward nadal ma 100%.
+    backward_progress_scale = 0.05
+
+    # Małe kroczki są OK.
+    backward_step_air_target = 0.10
+
+    # 2 cm = pełna jakość placementu.
+    # 1-5 mm nadal daje częściowy reward.
+    backward_step_placement_target = 0.015
+
+    # Dense: noga podczas swingu idzie w stronę komendy.
+    rew_scale_backward_swing_direction = 4.0
+
+    # Event: po swingu stopa ląduje ZA podporową
+    # w kierunku cofania.
+    rew_scale_backward_step_direction = 6.0
+
+    # Anty-szuranie zostaje.
+    rew_scale_backward_contact_slip = -6.0
+    rew_scale_backward_shuffle = -8.0
+
+    backward_shuffle_grace = 0.10
+    backward_shuffle_full = 0.25
+
+    # Małe kroczki są OK.
+    backward_air_deadband = 0.04
+
+    # ============================================================
+    # BACKWARD STRAIGHTENING
+    # Nie tworzymy osobnego rewardu za "stanie prosto".
+    # Prostota BRAMKUJE tylko istniejące rewardy backward gait.
+    # ============================================================
+
+    # Boczne przesuwanie podczas backward.
+    # 0.00 m/s -> factor 1.0
+    # 0.01 m/s -> ~0.78
+    # 0.02 m/s -> ~0.37
+    backward_straight_lateral_sigma = 0.020
+
+    # Yaw podczas backward.
+    # 0.00 rad/s -> factor 1.0
+    # 0.05 rad/s -> ~0.78
+    # 0.10 rad/s -> ~0.37
+    backward_straight_yaw_sigma = 0.10
+
+    # Nie zerujemy całkowicie rewardu przy krzywej próbie,
+    # bo nie chcemy zabić dopiero co odkrytego backward gait.
+    backward_swing_straightness_floor = 0.25
+    backward_step_straightness_floor = 0.10
+
+    # ============================================================
+    # BACKWARD - WYMUSZENIE NAPRZEMIENNEJ PRACY NÓG
+    # ============================================================
+
+    # Gdy jest kolej konkretnej nogi, jej prawdziwy swing
+    # jest bardziej wartościowy.
+    backward_expected_swing_scale = 1.50
+
+    # Jeśli agent próbuje ponownie użyć tej samej nogi,
+    # dense swing reward prawie znika.
+    backward_repeat_swing_scale = 0.15
+
+    # Powtórzony touchdown tej samej nogi nadal dostaje
+    # minimalny reward, żeby nie zrobić twardej ściany.
+    backward_repeat_step_scale = 0.10
+
+    # Po kroku jednej nogi nagradzamy PRAWDZIWE oderwanie
+    # oczekiwanej przeciwnej nogi.
+    rew_scale_backward_expected_swing_lift = 2.5
+
+    # Jeżeli oczekiwana noga zamiast się oderwać szura po ziemi.
+    rew_scale_backward_expected_foot_slip = -8.0
+
+    # ============================================================
+    # BACKWARD - PRAWDZIWE UŻYWANIE OBU NÓG
+    # ============================================================
+
+    backward_real_pair_alpha = 0.03
+    backward_real_pair_target = 0.08
+
+    rew_scale_backward_real_pair_use = 8.0
+    rew_scale_backward_real_swing_balance = -6.0
+
+
+
