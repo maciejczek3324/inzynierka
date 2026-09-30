@@ -59,6 +59,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._backward_yaw_target_w = torch.zeros(
             self.num_envs, device=self.device,
         )
+        # Punkt, przez który przechodzi linia cofania w world XY.
+        self._backward_line_origin_w = torch.zeros(
+            self.num_envs,
+            2,
+            device=self.device,
+        )
 
         self.gamepad = None
 
@@ -453,6 +459,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "backward_left_tangent_force_debug",
                 "backward_right_tangent_force_debug",
                 "backward_tangent_force_imbalance_debug",
+
+                "backward_world_lateral",
+                "backward_cross_track_error_debug",
+                "backward_lateral_command_debug",
+                "backward_line_quality_debug",
             ]
         }
 
@@ -745,6 +756,73 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             backward_mask, corrective_yaw_rate, self._commands[:, 2],
         )
 
+        # ============================================================
+        # BACKWARD WORLD-LINE HOLD
+        #
+        # cmd_y nie jest losową komendą lateral.
+        # Podczas backward staje się sygnałem:
+        # "wróć na linię i wygaś prędkość boczną".
+        #
+        # Nadal mamy 39 observations.
+        # ============================================================
+
+        target_c = torch.cos(self._backward_yaw_target_w)
+        target_s = torch.sin(self._backward_yaw_target_w)
+
+        root_xy = self._robot.data.root_pos_w[:, :2]
+
+        delta_x = root_xy[:, 0] - self._backward_line_origin_w[:, 0]
+        delta_y = root_xy[:, 1] - self._backward_line_origin_w[:, 1]
+
+        # Wektor normalny do początkowej osi ruchu.
+        backward_cross_track_error = (
+                -delta_x * target_s
+                + delta_y * target_c
+        )
+
+        vel_w = self._robot.data.root_lin_vel_w
+
+        backward_world_lateral_speed = (
+                -vel_w[:, 0] * target_s
+                + vel_w[:, 1] * target_c
+        )
+
+        # Deadband pozycji.
+        line_pos_error = torch.where(
+            torch.abs(backward_cross_track_error)
+            > self.cfg.backward_line_pos_deadband,
+            backward_cross_track_error,
+            torch.zeros_like(backward_cross_track_error),
+        )
+
+        # Deadband prędkości.
+        line_vel_error = torch.where(
+            torch.abs(backward_world_lateral_speed)
+            > self.cfg.backward_line_vel_deadband,
+            backward_world_lateral_speed,
+            torch.zeros_like(backward_world_lateral_speed),
+        )
+
+        # PD:
+        # pozycja mówi "wróć",
+        # prędkość mówi "wyhamuj boczne rozpędzenie".
+        backward_lateral_cmd = (
+                -self.cfg.backward_line_kp * line_pos_error
+                - self.cfg.backward_line_kd * line_vel_error
+        )
+
+        backward_lateral_cmd = torch.clamp(
+            backward_lateral_cmd,
+            min=-self.cfg.backward_line_max_lateral_cmd,
+            max=self.cfg.backward_line_max_lateral_cmd,
+        )
+
+        self._commands[:, 1] = torch.where(
+            backward_mask,
+            backward_lateral_cmd,
+            self._commands[:, 1],
+        )
+
     def _backward_heading_error(self) -> torch.Tensor:
         # Isaac Lab quaternion order: w, x, y, z.
         w, x, y, z = self._robot.data.root_quat_w.unbind(dim=-1)
@@ -921,24 +999,119 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             -vel_w[:, 0] * target_s + vel_w[:, 1] * target_c
         )
 
+        backward_world_lateral_excess = torch.clamp(
+            torch.abs(backward_world_lateral_speed)
+            - self.cfg.backward_world_lateral_deadband,
+            min=0.0,
+        )
+
+        backward_world_lateral_penalty = (
+                backward_cmd_gate
+                * torch.square(
+            torch.clamp(
+                backward_world_lateral_excess
+                /
+                (
+                        self.cfg.backward_world_lateral_full
+                        - self.cfg.backward_world_lateral_deadband
+                ),
+                min=0.0,
+                max=1.0,
+            )
+        )
+        )
+
+        root_xy = self._robot.data.root_pos_w[:, :2]
+
+        delta_x = root_xy[:, 0] - self._backward_line_origin_w[:, 0]
+        delta_y = root_xy[:, 1] - self._backward_line_origin_w[:, 1]
+
+        backward_cross_track_error = (
+                -delta_x * target_s
+                + delta_y * target_c
+        )
+
+        backward_lateral_line_quality = (
+                1.0
+                /
+                (
+                        1.0
+                        + torch.square(
+                    torch.abs(backward_world_lateral_speed)
+                    / self.cfg.backward_line_velocity_scale
+                )
+                )
+        )
+
+        backward_position_line_quality = (
+                1.0
+                /
+                (
+                        1.0
+                        + torch.square(
+                    torch.abs(backward_cross_track_error)
+                    / self.cfg.backward_line_position_scale
+                )
+                )
+        )
+
+        backward_line_quality = (
+                backward_lateral_line_quality
+                * backward_position_line_quality
+        )
+
+        backward_line_reward_gate = (
+                self.cfg.backward_line_reward_floor
+                +
+                (
+                        1.0
+                        - self.cfg.backward_line_reward_floor
+                )
+                * backward_line_quality
+        )
+
         # At a standstill, speed_gate is ZERO (no free velocity reward).
         # Overspeed and transverse drift smoothly reduce this positive term.
         speed_gate = torch.clamp(
             backward_world_speed / backward_target_speed,
             min=0.0, max=1.0,
         )
+        # backward_axis_track = (
+        #     backward_cmd_gate
+        #     * speed_gate
+        #     * torch.exp(-torch.square(
+        #         (backward_world_speed - backward_target_speed)
+        #         / self.cfg.backward_axis_speed_sigma
+        #     ))
+        #     * torch.exp(-torch.square(
+        #         backward_world_lateral_speed
+        #         / self.cfg.backward_axis_lateral_sigma
+        #     ))
+        #     * backward_heading_quality
+        # )
+        backward_world_lateral_error = (
+                backward_world_lateral_speed
+                - self._commands[:, 1]
+        )
         backward_axis_track = (
-            backward_cmd_gate
-            * speed_gate
-            * torch.exp(-torch.square(
+                backward_cmd_gate
+                * speed_gate
+
+                * torch.exp(
+            -torch.square(
                 (backward_world_speed - backward_target_speed)
                 / self.cfg.backward_axis_speed_sigma
-            ))
-            * torch.exp(-torch.square(
-                backward_world_lateral_speed
+            )
+        )
+
+                * torch.exp(
+            -torch.square(
+                backward_world_lateral_error
                 / self.cfg.backward_axis_lateral_sigma
-            ))
-            * backward_heading_quality
+            )
+        )
+
+                * backward_heading_quality
         )
 
         backward_signed_progress = torch.clamp(
@@ -5020,6 +5193,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     * backward_step_direction
                     * backward_step_straight_gate
                     * backward_heading_reward_gate
+                    * backward_line_reward_gate
                     * upright_gate
             ),
 
@@ -5054,6 +5228,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     self.cfg.rew_scale_backward_real_alt_step
                     * backward_real_alt_step
                     * backward_heading_reward_gate
+                    * backward_line_reward_gate
                     * upright_gate
             ),
 
@@ -5083,6 +5258,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             "backward_axis_track": (
                     self.cfg.rew_scale_backward_axis_track
                     * backward_axis_track
+                    * self.step_dt
+            ),
+            "backward_world_lateral": (
+                    self.cfg.rew_scale_backward_world_lateral
+                    * backward_world_lateral_penalty
                     * self.step_dt
             ),
 
@@ -5524,6 +5704,23 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * backward_cmd_gate
                 * self.step_dt
         )
+        self._episode_sums["backward_cross_track_error_debug"] += (
+                torch.abs(backward_cross_track_error)
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_lateral_command_debug"] += (
+                torch.abs(self._commands[:, 1])
+                * backward_cmd_gate
+                * self.step_dt
+        )
+
+        self._episode_sums["backward_line_quality_debug"] += (
+                backward_line_quality
+                * backward_cmd_gate
+                * self.step_dt
+        )
 
         return reward
 
@@ -5607,6 +5804,8 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._prev_right_contact[env_ids] = True
         self._roll_ema[env_ids] = 0.0
         # self._last_rewarded_step[env_ids] = 0
+
+        self._backward_line_origin_w[env_ids] = default_root_state[:, :2]
 
         self._backward_vel_ema[env_ids] = 0.0
 

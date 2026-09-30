@@ -528,5 +528,31 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Move in the requested direction in the ORIGINAL world heading,
     # not in the robot's rotated frame. Zero for no backward motion.
     backward_axis_speed_sigma = 0.070         # m/s, gradual overspeed reduction
-    backward_axis_lateral_sigma = 0.16        # m/s, gradual lateral reduction
-    rew_scale_backward_axis_track = 3.0
+    backward_axis_lateral_sigma = 0.08        # m/s, gradual lateral reduction
+    rew_scale_backward_axis_track = 5.0
+
+    # ============================================================
+    # BACKWARD WORLD-LINE HOLD
+    # Robot ma nie tylko patrzeć w dobrym kierunku,
+    # ale również pozostać na linii, z której rozpoczął cofanie.
+    # ============================================================
+
+    # PD -> korekcyjna komenda cmd_y.
+    backward_line_kp = 0.80
+    backward_line_kd = 0.35
+
+    backward_line_pos_deadband = 0.010  # 1 cm
+    backward_line_vel_deadband = 0.020  # 2 cm/s
+
+    # Nie każemy mu gwałtownie wracać na linię.
+    backward_line_max_lateral_cmd = 0.08  # m/s
+
+    # Jakość toru używana do bramkowania dużych rewardów kroku.
+    backward_line_velocity_scale = 0.08  # m/s
+    backward_line_position_scale = 0.06  # m
+    backward_line_reward_floor = 0.15
+
+    # Bezpośrednia kara za duży world-lateral drift.
+    backward_world_lateral_deadband = 0.03
+    backward_world_lateral_full = 0.20
+    rew_scale_backward_world_lateral = -2.0
