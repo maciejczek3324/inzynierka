@@ -401,10 +401,10 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # NOWY CURRICULUM
     # ------------------------------------------------------------
 
-    # Backward dostaje na początek tylko 25% normalnego
-    # rewardu za postęp bazy.
-    # Forward nadal ma 100%.
-    backward_progress_scale = 0.05
+    # Legacy heading-relative forward_progress is disabled for backward.
+    # Backward now has its own reward for WORLD-axis velocity.
+    # Forward retains 100% of its existing progress reward.
+    backward_progress_scale = 0.0
 
     # Małe kroczki są OK.
     backward_step_air_target = 0.10
@@ -418,7 +418,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
 
     # Event: po swingu stopa ląduje ZA podporową
     # w kierunku cofania.
-    rew_scale_backward_step_direction = 6.0
+    rew_scale_backward_step_direction = 2.0  # bootstrap; real cycle pays more
 
     # Anty-szuranie zostaje.
     rew_scale_backward_contact_slip = -6.0
@@ -463,11 +463,11 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
 
     # Jeśli agent próbuje ponownie użyć tej samej nogi,
     # dense swing reward prawie znika.
-    backward_repeat_swing_scale = 0.15
+    backward_repeat_swing_scale = 0.0
 
     # Powtórzony touchdown tej samej nogi nadal dostaje
     # minimalny reward, żeby nie zrobić twardej ściany.
-    backward_repeat_step_scale = 0.10
+    backward_repeat_step_scale = 0.0
 
     # Po kroku jednej nogi nagradzamy PRAWDZIWE oderwanie
     # oczekiwanej przeciwnej nogi.
@@ -483,8 +483,50 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     backward_real_pair_alpha = 0.03
     backward_real_pair_target = 0.08
 
-    rew_scale_backward_real_pair_use = 8.0
+    rew_scale_backward_real_pair_use = 3.0  # support shaping, not main goal
     rew_scale_backward_real_swing_balance = -6.0
 
+    backward_real_lift_target = 0.025  # 25 mm = pełna jakość
+
+    # NOWE: ukończony prawdziwy NAPRZEMIENNY krok.
+    rew_scale_backward_real_alt_step = 8.0
+
+    # NOWE: jeśli robot jedzie dzięki "pchaniu" przy słabym użyciu obu nóg.
+    rew_scale_backward_push_glide = -6.0
+
+    # Oczekiwana noga ma zginać kolano podczas prawdziwego swingu.
+    rew_scale_backward_expected_knee_flex = 2.0
+
+    # Backward-specific actual knee flex -> partial extension.
+    # Left flex = +delta, right flex = -delta.
+    backward_knee_flex_target = 0.12        # rad, extra flex after liftoff
+    backward_knee_extension_target = 0.08  # rad, extension from swing peak
+    backward_knee_min_flex = 0.035         # rad, cycle event minimum
+    backward_knee_min_extension = 0.020   # rad, cycle event minimum
+    backward_cycle_lift_min = 0.010        # m, only accepted step
+    rew_scale_backward_knee_extension = 3.0
 
 
+
+
+
+
+
+    # ============================================================
+    # BACKWARD: FIXED WORLD HEADING + WORLD-AXIS VELOCITY
+    # Keeps observation_space=39: correction uses existing cmd yaw channel.
+    # ============================================================
+    backward_heading_kp = 1.5                  # 1/s, yaw-rate = kp * heading error
+    backward_heading_max_yaw_rate = 0.40       # rad/s, only during backward
+    backward_heading_deadband = 0.035          # rad (~2 deg)
+    backward_heading_penalty_span = 0.50       # rad after deadband -> full loss
+    backward_heading_quality_sigma = 0.60     # rad, attenuate gait rewards on turns
+    backward_heading_gait_floor = 0.15        # still enough gradient at bad yaw
+    backward_heading_fail_angle = 1.00        # rad (~57 deg), backward only
+    rew_scale_backward_heading_hold = -3.0
+
+    # Move in the requested direction in the ORIGINAL world heading,
+    # not in the robot's rotated frame. Zero for no backward motion.
+    backward_axis_speed_sigma = 0.070         # m/s, gradual overspeed reduction
+    backward_axis_lateral_sigma = 0.16        # m/s, gradual lateral reduction
+    rew_scale_backward_axis_track = 3.0
