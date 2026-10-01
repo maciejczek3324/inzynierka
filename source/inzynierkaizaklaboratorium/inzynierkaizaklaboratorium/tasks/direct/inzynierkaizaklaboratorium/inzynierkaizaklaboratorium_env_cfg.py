@@ -48,6 +48,12 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Pełny zakres ruchu potrzebny do zginania kolan.
     action_scale = 0.5
 
+    # Górne przeguby obrotowe obrot1/obrot2 były celowo ograniczone do 0.08 rad.
+    # Zachowujemy tę ochronę dla starego forward/backward/side, żeby nie
+    # rozwalić wyuczonych gaitów. Przy PURE YAW odblokowujemy je mocniej.
+    turn_action_scale_locomotion = 0.08
+    turn_action_scale_yaw = 0.30
+
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
         render_interval=decimation,
@@ -114,8 +120,16 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Startujemy od prostego chodu do przodu.
     # Cały reward i obserwacje są już 2D+yaw, więc później zmieniasz tylko
     # command_mode na "omni" bez przebudowy sieci.
-    command_mode = "forward_backward"
-    forward_command_x = -0.02 #docelowo 0.12
+    command_mode = "forward_backward_side_yaw"
+
+    # Komenda używana przy num_envs == 1 (PLAY / szybki test checkpointu).
+    # STAGE TURN: czysty obrót w miejscu, bez translacji.
+    play_command_x = 0.0
+    play_command_y = 0.0
+    play_command_yaw = 0.25
+
+    # Zostawione dla kompatybilności ze starszym kodem/testami.
+    forward_command_x = -0.02  # docelowo 0.12
 
     # TRAINING: losowana prędkość do przodu.
     # forward_command_min = 0.08
@@ -556,3 +570,111 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     backward_world_lateral_deadband = 0.03
     backward_world_lateral_full = 0.20
     rew_scale_backward_world_lateral = -2.0
+
+    # ============================================================
+    # SIDE WALK - STAGE 1
+    #
+    # Zachowujemy wyuczony forward / backward / stand i dokładamy
+    # małe, czyste komendy +/-Y bez obracania kadłuba.
+    # ============================================================
+
+    # Spośród komend RUCHU 35% to side.
+    # Przy standing_command_probability = 0.10 daje około:
+    # 31.5% side, 29.25% forward, 29.25% backward, 10% stand.
+    # W STAGE TURN side zajmuje 30% komend ruchu; yaw ma osobne 35%.
+    side_probability = 0.30
+
+    # Na start małe prędkości, żeby wykorzystać transfer istniejącego gaitu.
+    side_command_min = 0.025
+    side_command_max = 0.045
+
+    # ============================================================
+    # SIDE STEP-TOGETHER ("ODSTAWNO-DOSTAWNY")
+    #
+    # +Y: lewa noga odstawia -> prawa dostawia
+    # -Y: prawa noga odstawia -> lewa dostawia
+    #
+    # Pełna nagroda wymaga:
+    # - ruchu stopy W BOK zgodnie z komendą,
+    # - realnego liftu,
+    # - braku krzyżowania nóg,
+    # - małego rozjazdu przód/tył stóp,
+    # - po "odstawieniu" zwiększenia rozstawu,
+    # - po "dostawieniu" powrotu do normalnego rozstawu.
+    # ============================================================
+
+    side_air_deadband = 0.04
+    side_air_target = 0.12
+
+    side_step_displacement_min = 0.010       # 1 cm: minimalny realny krok w bok
+    side_step_displacement_target = 0.035    # 3.5 cm: pełna jakość przesunięcia stopy
+
+    side_min_clearance = 0.010               # 1 cm: stopa musi się realnie oderwać
+    side_clearance_target = 0.025            # 2.5 cm: pełna jakość liftu
+
+    side_open_width_min = 0.010              # lead foot musi realnie "otworzyć" rozstaw
+    side_open_width_target = 0.025           # 2.5 cm dodatkowego rozstawu = pełna jakość
+
+    side_close_width_sigma = 0.018           # trailing foot ma wrócić do rozstawu bazowego
+    side_close_accept_error = 0.025          # max błąd rozstawu przy zaakceptowanym "dostaw"
+
+    side_min_width_ratio = 0.55              # nogi nie mogą się skrzyżować / zapaść do środka
+
+    # Stopy mają być obok siebie w osi X, nie jedna wyraźnie "z przodu".
+    side_fore_aft_deadband = 0.015           # 1.5 cm bez kary
+    side_fore_aft_full = 0.060               # 6 cm = pełna kara
+    side_fore_aft_quality_scale = 0.035
+
+    # Generic step_complete zostawiamy jako bootstrap, ale główną nagrodą
+    # ma być teraz poprawna sekwencja ODSTAW -> DOSTAW.
+    side_generic_step_scale = 0.20
+
+    rew_scale_side_expected_swing = 3.0
+    rew_scale_side_lead_step = 6.0
+    rew_scale_side_trail_step = 10.0
+    rew_scale_side_fore_aft = -6.0
+    rew_scale_side_narrow_stance = -6.0
+
+    # Heading hold: side ma być translacją +/-Y bez obracania robota.
+    # Używa tego samego world-heading reference zapisanego na resecie.
+    side_heading_kp = 1.50
+    side_heading_max_yaw_rate = 0.30
+    side_heading_deadband = 0.035
+    side_heading_penalty_span = 0.50
+    side_heading_fail_angle = 1.00
+    rew_scale_side_heading_hold = -2.0
+
+    # Chód boczny wymaga świadomego transferu ciężaru w roll.
+    # Nie wyłączamy ochrony roll, tylko osłabiamy ją podczas pure-side.
+    side_roll_penalty_scale = 0.35
+
+    # Dodatkowa kara za przesuwanie stopy po ziemi podczas side.
+    # Bazowy foot_slip nadal działa.
+    rew_scale_side_contact_slip = -6.0
+
+    # ============================================================
+    # PURE YAW TURN - STAGE 1
+    #
+    # Uczymy najpierw obrotu CAŁEJ BAZY w miejscu:
+    # cmd_x = 0, cmd_y = 0, cmd_yaw != 0.
+    # Dopiero po opanowaniu tego etapu połączymy yaw z translacją i padem.
+    # ============================================================
+
+    # Spośród wszystkich komend RUCHU 35% to czysty obrót.
+    # Przy stand=10%, side=30% daje w przybliżeniu:
+    # 31.5% yaw, 27% side, 15.75% forward, 15.75% backward, 10% stand.
+    yaw_turn_probability = 0.35
+
+    # Spokojny początek. 0.15-0.35 rad/s ~= 8.6-20 deg/s.
+    yaw_turn_command_min = 0.15
+    yaw_turn_command_max = 0.35
+
+    # Prawdziwy turn powinien być realizowany krokami, nie skręcaniem stóp
+    # po ziemi. Dense swing pomaga odkryć mechanikę, touchdown ją utrwala.
+    yaw_turn_step_track_floor = 0.25
+    rew_scale_yaw_turn_swing = 1.5
+    rew_scale_yaw_turn_step = 4.0
+
+    # Anty-exploity dla obrotu w miejscu.
+    rew_scale_yaw_turn_contact_slip = -8.0
+    rew_scale_yaw_turn_translation = -12.0
