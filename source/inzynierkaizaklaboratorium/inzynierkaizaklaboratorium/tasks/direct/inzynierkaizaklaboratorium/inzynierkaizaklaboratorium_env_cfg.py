@@ -52,7 +52,11 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Zachowujemy tę ochronę dla starego forward/backward/side, żeby nie
     # rozwalić wyuczonych gaitów. Przy PURE YAW odblokowujemy je mocniej.
     turn_action_scale_locomotion = 0.08
-    turn_action_scale_yaw = 0.30
+    turn_action_scale_yaw = 0.50
+
+    # Przy PURE YAW górne przeguby dostają też szybszą odpowiedź celu.
+    # Reszta chodu nadal używa starego target_filter_alpha = 0.20.
+    turn_target_filter_alpha_yaw = 0.40
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
@@ -126,7 +130,7 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # STAGE TURN: czysty obrót w miejscu, bez translacji.
     play_command_x = 0.0
     play_command_y = 0.0
-    play_command_yaw = 0.25
+    play_command_yaw = 0.45
 
     # Zostawione dla kompatybilności ze starszym kodem/testami.
     forward_command_x = -0.02  # docelowo 0.12
@@ -665,16 +669,42 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # 31.5% yaw, 27% side, 15.75% forward, 15.75% backward, 10% stand.
     yaw_turn_probability = 0.35
 
-    # Spokojny początek. 0.15-0.35 rad/s ~= 8.6-20 deg/s.
-    yaw_turn_command_min = 0.15
-    yaw_turn_command_max = 0.35
+    # FINAL TURN STAGE: szybszy, ale nadal rozsądny zakres.
+    # 0.25-0.55 rad/s ~= 14.3-31.5 deg/s. PLAY = 0.45 rad/s ~= 25.8 deg/s.
+    yaw_turn_command_min = 0.25
+    yaw_turn_command_max = 0.55
 
-    # Prawdziwy turn powinien być realizowany krokami, nie skręcaniem stóp
-    # po ziemi. Dense swing pomaga odkryć mechanikę, touchdown ją utrwala.
-    yaw_turn_step_track_floor = 0.25
-    rew_scale_yaw_turn_swing = 1.5
-    rew_scale_yaw_turn_step = 4.0
+    # ------------------------------------------------------------
+    # PRAWDZIWY KROK SKRĘTNY
+    # ------------------------------------------------------------
+    # Minimalny lokalny fore-aft arc swing-foot. Dla +yaw lewa idzie
+    # lekko w tył, prawa w przód; dla -yaw odwrotnie.
+    yaw_turn_arc_deadband = 0.006
+    yaw_turn_arc_target = 0.035
+
+    # Realny liftoff/air-time - nie nagradzamy szurania i mikro-touchdownów.
+    yaw_turn_lift_target = 0.018
+    yaw_turn_air_deadband = 0.045
+    yaw_turn_air_target = 0.14
+
+    # Górny yaw-joint może wyraźnie pracować w SWINGU.
+    # Po kontakcie duże wykręcenie staje się drogie, dzięki czemu noga
+    # podporowa prostuje obrot1/obrot2 i obraca nad nią bazę.
+    yaw_turn_hip_twist_deadband = 0.08
+    yaw_turn_hip_twist_target = 0.30
+    yaw_turn_stance_twist_deadband = 0.12
+    yaw_turn_stance_twist_full = 0.35
+
+    # Same-side repeat zachowuje mały discovery signal, pełna kasa jest
+    # za naprzemienny krok.
+    yaw_turn_repeat_scale = 0.15
+
+    # Dense discovery + real touchdown event + cykl swing/recenter.
+    rew_scale_yaw_turn_swing = 2.0
+    rew_scale_yaw_turn_swing_twist = 1.5
+    rew_scale_yaw_turn_step = 8.0
+    rew_scale_yaw_turn_stance_twist = -3.0
 
     # Anty-exploity dla obrotu w miejscu.
     rew_scale_yaw_turn_contact_slip = -8.0
-    rew_scale_yaw_turn_translation = -12.0
+    rew_scale_yaw_turn_translation = -8.0

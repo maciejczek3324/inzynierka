@@ -105,6 +105,31 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             device=self.device,
         )
 
+        # ============================================================
+        # PURE YAW TURN - PAMIĘĆ PRAWDZIWEGO KROKU SKRĘTNEGO
+        #
+        # Każda stopa zapamiętuje world-XY z chwili liftoff.
+        # Dodatkowo zapisujemy największe użycie górnego yaw-joint podczas
+        # tego swingu. Dzięki temu touchdown nie jest nagradzany za samo
+        # dreptanie: musi istnieć realny łuk stopy + użycie obrot1/obrot2.
+        # ============================================================
+        self._left_yaw_swing_start_xy = torch.zeros(
+            self.num_envs, 2, device=self.device,
+        )
+        self._right_yaw_swing_start_xy = torch.zeros(
+            self.num_envs, 2, device=self.device,
+        )
+        self._left_yaw_turn_peak = torch.zeros(
+            self.num_envs, device=self.device,
+        )
+        self._right_yaw_turn_peak = torch.zeros(
+            self.num_envs, device=self.device,
+        )
+        # -1 = ostatni realny krok lewą, +1 = prawą, 0 = brak historii.
+        self._last_yaw_turn_step = torch.zeros(
+            self.num_envs, dtype=torch.int8, device=self.device,
+        )
+
         self.gamepad = None
 
         if self.num_envs == 1:
@@ -525,15 +550,23 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "side_lead_displacement_debug",
                 "side_trail_displacement_debug",
 
-                # PURE YAW TURN - STAGE 1
+                # PURE YAW TURN - FINAL STEP/TURN/RECENTER STAGE
                 "yaw_turn_swing",
+                "yaw_turn_swing_twist",
                 "yaw_turn_step",
+                "yaw_turn_stance_twist",
                 "yaw_turn_contact_slip",
                 "yaw_turn_translation",
                 "yaw_turn_fraction_debug",
                 "yaw_turn_command_debug",
                 "yaw_turn_rate_debug",
+                "yaw_turn_signed_rate_debug",
                 "yaw_turn_error_debug",
+                "yaw_turn_direction_quality_debug",
+                "yaw_turn_arc_debug",
+                "yaw_turn_repeat_debug",
+                "yaw_turn_swing_turn_abs_debug",
+                "yaw_turn_stance_turn_abs_debug",
                 "yaw_turn_obrot1_abs_debug",
                 "yaw_turn_obrot2_abs_debug",
             ]
@@ -1054,9 +1087,32 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 + action_scale * self._actions
         )
 
+        # Bazowo zachowujemy stare wygładzanie targetów.
+        # Podczas PURE YAW tylko obrot1/obrot2 dostają szybszą odpowiedź,
+        # żeby filtr 0.20 nie tłumił większego kroku skrętnego.
+        filter_alpha = torch.full_like(
+            self._actions,
+            self.cfg.target_filter_alpha,
+        )
+
+        turn_filter_alpha = torch.where(
+            pure_yaw_scale_mask,
+            torch.full_like(
+                self._commands[:, 0],
+                self.cfg.turn_target_filter_alpha_yaw,
+            ),
+            torch.full_like(
+                self._commands[:, 0],
+                self.cfg.target_filter_alpha,
+            ),
+        )
+
+        filter_alpha[:, self.turn_l_idx] = turn_filter_alpha
+        filter_alpha[:, self.turn_r_idx] = turn_filter_alpha
+
         filtered_targets = (
-                self.cfg.target_filter_alpha * desired_targets
-                + (1.0 - self.cfg.target_filter_alpha) * self._current_targets
+            filter_alpha * desired_targets
+            + (1.0 - filter_alpha) * self._current_targets
         )
 
         max_target_delta = 5.24 * self.step_dt
@@ -2557,6 +2613,93 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 + side_expect_right_trail.float()
                 * torch.clamp(right_side_displacement, min=0.0)
         )
+        # ============================================================
+        # PURE YAW TURN - LIFTOFF + REALNY ŁUK STOPY
+        #
+        # Przy dodatnim yaw (+Z / CCW):
+        #   lewa stopa powinna podczas swojego swingu przesunąć się
+        #   w lokalnym X lekko DO TYŁU, prawa lekko DO PRZODU.
+        # Przy ujemnym yaw znaki odwracają się.
+        #
+        # Mierzymy displacement w WORLD od prawdziwego liftoff, więc samo
+        # obrócenie/przesunięcie bazy nie może udawać kroku stopy.
+        # ============================================================
+
+        yaw_turn_active = yaw_turn_cmd_gate.bool()
+
+        left_yaw_liftoff = (
+                yaw_turn_active
+                & (~left_contact)
+                & self._prev_left_contact
+                & right_contact
+        )
+        right_yaw_liftoff = (
+                yaw_turn_active
+                & (~right_contact)
+                & self._prev_right_contact
+                & left_contact
+        )
+
+        self._left_yaw_swing_start_xy = torch.where(
+            left_yaw_liftoff.unsqueeze(1),
+            pos_l[:, :2],
+            self._left_yaw_swing_start_xy,
+        )
+        self._right_yaw_swing_start_xy = torch.where(
+            right_yaw_liftoff.unsqueeze(1),
+            pos_r[:, :2],
+            self._right_yaw_swing_start_xy,
+        )
+
+        left_yaw_disp_w = torch.zeros(
+            self.num_envs, 3, device=self.device,
+        )
+        right_yaw_disp_w = torch.zeros(
+            self.num_envs, 3, device=self.device,
+        )
+        left_yaw_disp_w[:, :2] = (
+            pos_l[:, :2] - self._left_yaw_swing_start_xy
+        )
+        right_yaw_disp_w[:, :2] = (
+            pos_r[:, :2] - self._right_yaw_swing_start_xy
+        )
+
+        # Rzut displacementu do AKTUALNEGO heading frame.
+        # Swing jest krótki, więc ten frame daje stabilny lokalny przód/tył,
+        # a world-cache nadal chroni przed oszukiwaniem ruchem samej bazy.
+        left_yaw_disp_heading = quat_apply_inverse(
+            heading_quat, left_yaw_disp_w,
+        )
+        right_yaw_disp_heading = quat_apply_inverse(
+            heading_quat, right_yaw_disp_w,
+        )
+
+        yaw_turn_sign = torch.sign(self._commands[:, 2])
+
+        # +yaw: L -> -X, R -> +X.  -yaw: odwrotnie.
+        left_yaw_signed_arc = (
+            -yaw_turn_sign * left_yaw_disp_heading[:, 0]
+        )
+        right_yaw_signed_arc = (
+            yaw_turn_sign * right_yaw_disp_heading[:, 0]
+        )
+
+        yaw_arc_span = max(
+            self.cfg.yaw_turn_arc_target
+            - self.cfg.yaw_turn_arc_deadband,
+            1.0e-4,
+        )
+        left_yaw_arc_quality = torch.clamp(
+            (left_yaw_signed_arc - self.cfg.yaw_turn_arc_deadband)
+            / yaw_arc_span,
+            min=0.0, max=1.0,
+        )
+        right_yaw_arc_quality = torch.clamp(
+            (right_yaw_signed_arc - self.cfg.yaw_turn_arc_deadband)
+            / yaw_arc_span,
+            min=0.0, max=1.0,
+        )
+
         # ============================================================
         # BACKWARD LIFTOFF
         # Zapamiętujemy gdzie była stopa, gdy NAPRAWDĘ straciła kontakt.
@@ -5209,29 +5352,256 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         )
 
         # ============================================================
-        # PURE YAW TURN - PRAWDZIWY OBRÓT KROKAMI
+        # PURE YAW TURN - FINALNY CYKL: STEP -> TURN -> RECENTER
         #
-        # Sam yaw tracking mógłby zostać zrealizowany przez tarcie / szuranie.
-        # Dlatego osobno nagradzamy realny swing/touchdown i karzemy
-        # przesuwanie stóp po ziemi oraz translację środka bazy.
+        # Poprzednio prawie każdy touchdown dostawał dużą nagrodę, więc
+        # policy nauczyła się drobnego dreptania na stale wykręconych
+        # obrot1/obrot2. Teraz duża nagroda wymaga REALNEGO łuku stopy,
+        # liftoff/air-time i obrotu bazy we właściwym kierunku.
+        #
+        # Jednocześnie:
+        #   - swing leg może mocno użyć swojego górnego yaw-joint,
+        #   - po lądowaniu, gdy staje się nogą podporową, duże wykręcenie
+        #     jest karane -> staw ma wracać w stronę neutralu.
+        # To daje naturalny cykl: wykręć w powietrzu -> postaw -> obróć
+        # bazę przez prostowanie nogi podporowej -> druga noga przejmuje swing.
         # ============================================================
 
-        yaw_turn_track_gate = (
-            self.cfg.yaw_turn_step_track_floor
-            + (1.0 - self.cfg.yaw_turn_step_track_floor) * track_yaw_vel
+        turn_l_abs = torch.abs(joint_delta_all[:, self.turn_l_idx])
+        turn_r_abs = torch.abs(joint_delta_all[:, self.turn_r_idx])
+
+        # Peak użycia górnego yaw-joint w bieżącym swingu.
+        # Poza pure-yaw zerujemy pamięć, żeby kolejny turn zaczynał czysto.
+        self._left_yaw_turn_peak = torch.where(
+            yaw_turn_active,
+            self._left_yaw_turn_peak,
+            torch.zeros_like(self._left_yaw_turn_peak),
+        )
+        self._right_yaw_turn_peak = torch.where(
+            yaw_turn_active,
+            self._right_yaw_turn_peak,
+            torch.zeros_like(self._right_yaw_turn_peak),
+        )
+        self._last_yaw_turn_step = torch.where(
+            yaw_turn_active,
+            self._last_yaw_turn_step,
+            torch.zeros_like(self._last_yaw_turn_step),
         )
 
+        self._left_yaw_turn_peak = torch.where(
+            left_yaw_liftoff, turn_l_abs, self._left_yaw_turn_peak,
+        )
+        self._right_yaw_turn_peak = torch.where(
+            right_yaw_liftoff, turn_r_abs, self._right_yaw_turn_peak,
+        )
+        self._left_yaw_turn_peak = torch.where(
+            yaw_turn_active & left_swing,
+            torch.maximum(self._left_yaw_turn_peak, turn_l_abs),
+            self._left_yaw_turn_peak,
+        )
+        self._right_yaw_turn_peak = torch.where(
+            yaw_turn_active & right_swing,
+            torch.maximum(self._right_yaw_turn_peak, turn_r_abs),
+            self._right_yaw_turn_peak,
+        )
+
+        # Czy baza obraca się we właściwą stronę?
+        yaw_cmd_abs = torch.clamp(
+            torch.abs(self._commands[:, 2]), min=1.0e-4,
+        )
+        yaw_turn_signed_rate = (
+            torch.sign(self._commands[:, 2]) * yaw_rate
+        )
+        yaw_turn_direction_quality = torch.clamp(
+            yaw_turn_signed_rate / yaw_cmd_abs,
+            min=0.0, max=1.0,
+        )
+
+        # ------------------------------------------------------------
+        # SWING HIP-YAW: pozwalamy/nagradzamy wyraźne użycie obrot1/2
+        # tylko wtedy, gdy TA noga naprawdę jest w powietrzu.
+        # ------------------------------------------------------------
+        yaw_twist_span = max(
+            self.cfg.yaw_turn_hip_twist_target
+            - self.cfg.yaw_turn_hip_twist_deadband,
+            1.0e-4,
+        )
+        left_turn_twist_quality = torch.clamp(
+            (turn_l_abs - self.cfg.yaw_turn_hip_twist_deadband)
+            / yaw_twist_span,
+            min=0.0, max=1.0,
+        )
+        right_turn_twist_quality = torch.clamp(
+            (turn_r_abs - self.cfg.yaw_turn_hip_twist_deadband)
+            / yaw_twist_span,
+            min=0.0, max=1.0,
+        )
+
+        yaw_turn_swing_twist = (
+            yaw_turn_cmd_gate
+            * (
+                left_swing.float() * left_turn_twist_quality
+                + right_swing.float() * right_turn_twist_quality
+            )
+            * (0.20 + 0.80 * yaw_turn_direction_quality)
+        )
+
+        # ------------------------------------------------------------
+        # STANCE RECENTER: duże wykręcenie jest dozwolone w SWINGU,
+        # ale po postawieniu stopy ma znikać. To jest właściwe
+        # "prostowanie obrot1/obrot2" między kolejnymi krokami.
+        # ------------------------------------------------------------
+        stance_twist_span = max(
+            self.cfg.yaw_turn_stance_twist_full
+            - self.cfg.yaw_turn_stance_twist_deadband,
+            1.0e-4,
+        )
+        left_stance_twist_excess = torch.clamp(
+            (turn_l_abs - self.cfg.yaw_turn_stance_twist_deadband)
+            / stance_twist_span,
+            min=0.0, max=1.0,
+        )
+        right_stance_twist_excess = torch.clamp(
+            (turn_r_abs - self.cfg.yaw_turn_stance_twist_deadband)
+            / stance_twist_span,
+            min=0.0, max=1.0,
+        )
+        yaw_turn_stance_twist = (
+            yaw_turn_cmd_gate
+            * (
+                left_contact.float()
+                * torch.square(left_stance_twist_excess)
+                + right_contact.float()
+                * torch.square(right_stance_twist_excess)
+            )
+        )
+
+        # ------------------------------------------------------------
+        # DENSE SWING: realny łuk world-foot + realny lift.
+        # Nie płacimy już tylko za "mam jedną nogę w powietrzu".
+        # ------------------------------------------------------------
+        yaw_turn_active_arc_quality = (
+            left_swing.float() * left_yaw_arc_quality
+            + right_swing.float() * right_yaw_arc_quality
+        )
         yaw_turn_swing = (
             yaw_turn_cmd_gate
-            * single_support.float()
-            * torch.square(swing_height_quality)
-            * yaw_turn_track_gate
+            * yaw_turn_active_arc_quality
+            * (0.20 + 0.80 * swing_height_quality)
+            * (0.15 + 0.85 * yaw_turn_direction_quality)
+        )
+
+        # ------------------------------------------------------------
+        # REAL STEP EVENT
+        # touchdown ma wartość dopiero po: air-time + lift + łuk stopy.
+        # Peak hip-yaw wzmacnia krok, ale nie jest twardą blokadą, żeby
+        # nie narzucać policy jednej jedynej kinematyki.
+        # ------------------------------------------------------------
+        yaw_air_span = max(
+            self.cfg.yaw_turn_air_target
+            - self.cfg.yaw_turn_air_deadband,
+            1.0e-4,
+        )
+        left_yaw_air_quality = torch.clamp(
+            (left_last_air_time_bw - self.cfg.yaw_turn_air_deadband)
+            / yaw_air_span,
+            min=0.0, max=1.0,
+        )
+        right_yaw_air_quality = torch.clamp(
+            (right_last_air_time_bw - self.cfg.yaw_turn_air_deadband)
+            / yaw_air_span,
+            min=0.0, max=1.0,
+        )
+
+        left_yaw_lift_quality = torch.clamp(
+            self._left_max_clearance / self.cfg.yaw_turn_lift_target,
+            min=0.0, max=1.0,
+        )
+        right_yaw_lift_quality = torch.clamp(
+            self._right_max_clearance / self.cfg.yaw_turn_lift_target,
+            min=0.0, max=1.0,
+        )
+
+        left_yaw_peak_quality = torch.clamp(
+            (self._left_yaw_turn_peak
+             - self.cfg.yaw_turn_hip_twist_deadband)
+            / yaw_twist_span,
+            min=0.0, max=1.0,
+        )
+        right_yaw_peak_quality = torch.clamp(
+            (self._right_yaw_turn_peak
+             - self.cfg.yaw_turn_hip_twist_deadband)
+            / yaw_twist_span,
+            min=0.0, max=1.0,
+        )
+
+        left_yaw_real_step = (
+            left_first_contact_bw.float()
+            * right_contact.float()
+            * left_yaw_arc_quality
+            * (0.20 + 0.80 * left_yaw_air_quality)
+            * (0.20 + 0.80 * left_yaw_lift_quality)
+            * (0.20 + 0.80 * left_yaw_peak_quality)
+            * yaw_turn_direction_quality
+        )
+        right_yaw_real_step = (
+            right_first_contact_bw.float()
+            * left_contact.float()
+            * right_yaw_arc_quality
+            * (0.20 + 0.80 * right_yaw_air_quality)
+            * (0.20 + 0.80 * right_yaw_lift_quality)
+            * (0.20 + 0.80 * right_yaw_peak_quality)
+            * yaw_turn_direction_quality
+        )
+
+        # Same-side repeat może dostać mały discovery reward, ale pełna
+        # nagroda wymaga naprzemiennego użycia nóg.
+        left_yaw_repeat = (self._last_yaw_turn_step == -1)
+        right_yaw_repeat = (self._last_yaw_turn_step == 1)
+        left_yaw_step_weight = torch.where(
+            left_yaw_repeat,
+            torch.full_like(left_yaw_real_step, self.cfg.yaw_turn_repeat_scale),
+            torch.ones_like(left_yaw_real_step),
+        )
+        right_yaw_step_weight = torch.where(
+            right_yaw_repeat,
+            torch.full_like(right_yaw_real_step, self.cfg.yaw_turn_repeat_scale),
+            torch.ones_like(right_yaw_real_step),
         )
 
         yaw_turn_step = (
             yaw_turn_cmd_gate
-            * (left_step_complete_normal + right_step_complete_normal)
-            * yaw_turn_track_gate
+            * (
+                left_yaw_real_step * left_yaw_step_weight
+                + right_yaw_real_step * right_yaw_step_weight
+            )
+        )
+
+        yaw_turn_repeat_debug = (
+            yaw_turn_cmd_gate
+            * (
+                left_yaw_real_step * left_yaw_repeat.float()
+                + right_yaw_real_step * right_yaw_repeat.float()
+            )
+        )
+
+        left_yaw_accepted = (
+            yaw_turn_active
+            & (left_yaw_real_step > 0.05)
+        )
+        right_yaw_accepted = (
+            yaw_turn_active
+            & (right_yaw_real_step > 0.05)
+        )
+        self._last_yaw_turn_step = torch.where(
+            left_yaw_accepted,
+            torch.full_like(self._last_yaw_turn_step, -1),
+            self._last_yaw_turn_step,
+        )
+        self._last_yaw_turn_step = torch.where(
+            right_yaw_accepted,
+            torch.full_like(self._last_yaw_turn_step, 1),
+            self._last_yaw_turn_step,
         )
 
         yaw_turn_contact_slip = (
@@ -5390,6 +5760,18 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             right_touchdown,
             torch.zeros_like(self._right_max_clearance),
             self._right_max_clearance,
+        )
+
+        # Yaw-turn peak także jest konsumowany przez touchdown reward powyżej.
+        self._left_yaw_turn_peak = torch.where(
+            left_touchdown,
+            torch.zeros_like(self._left_yaw_turn_peak),
+            self._left_yaw_turn_peak,
+        )
+        self._right_yaw_turn_peak = torch.where(
+            right_touchdown,
+            torch.zeros_like(self._right_yaw_turn_peak),
+            self._right_yaw_turn_peak,
         )
 
         # All touchdown rewards have already read the previous knee peak.
@@ -5908,9 +6290,19 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * yaw_turn_swing
                 * self.step_dt
             ),
+            "yaw_turn_swing_twist": (
+                self.cfg.rew_scale_yaw_turn_swing_twist
+                * yaw_turn_swing_twist
+                * self.step_dt
+            ),
             "yaw_turn_step": (
                 self.cfg.rew_scale_yaw_turn_step
                 * yaw_turn_step
+            ),
+            "yaw_turn_stance_twist": (
+                self.cfg.rew_scale_yaw_turn_stance_twist
+                * yaw_turn_stance_twist
+                * self.step_dt
             ),
             "yaw_turn_contact_slip": (
                 self.cfg.rew_scale_yaw_turn_contact_slip
@@ -6672,8 +7064,55 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             * self.step_dt
         )
 
+        self._episode_sums["yaw_turn_signed_rate_debug"] += (
+            yaw_turn_signed_rate
+            * yaw_turn_cmd_gate
+            * self.step_dt
+        )
+
         self._episode_sums["yaw_turn_error_debug"] += (
             torch.abs(self._commands[:, 2] - yaw_rate)
+            * yaw_turn_cmd_gate
+            * self.step_dt
+        )
+
+        self._episode_sums["yaw_turn_direction_quality_debug"] += (
+            yaw_turn_direction_quality
+            * yaw_turn_cmd_gate
+            * self.step_dt
+        )
+
+        yaw_turn_active_arc = (
+            left_swing.float() * torch.clamp(left_yaw_signed_arc, min=0.0)
+            + right_swing.float() * torch.clamp(right_yaw_signed_arc, min=0.0)
+        )
+        self._episode_sums["yaw_turn_arc_debug"] += (
+            yaw_turn_active_arc
+            * yaw_turn_cmd_gate
+            * self.step_dt
+        )
+
+        self._episode_sums["yaw_turn_repeat_debug"] += (
+            yaw_turn_repeat_debug
+        )
+
+        yaw_turn_swing_turn_abs = (
+            left_swing.float() * turn_l_abs
+            + right_swing.float() * turn_r_abs
+        )
+        yaw_turn_stance_turn_abs = (
+            left_swing.float() * turn_r_abs
+            + right_swing.float() * turn_l_abs
+            + (left_contact & right_contact).float()
+            * 0.5 * (turn_l_abs + turn_r_abs)
+        )
+        self._episode_sums["yaw_turn_swing_turn_abs_debug"] += (
+            yaw_turn_swing_turn_abs
+            * yaw_turn_cmd_gate
+            * self.step_dt
+        )
+        self._episode_sums["yaw_turn_stance_turn_abs_debug"] += (
+            yaw_turn_stance_turn_abs
             * yaw_turn_cmd_gate
             * self.step_dt
         )
@@ -6987,6 +7426,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._side_foot_order_sign[env_ids] = 1.0
         self._left_side_swing_start_xy[env_ids] = 0.0
         self._right_side_swing_start_xy[env_ids] = 0.0
+
+        self._left_yaw_swing_start_xy[env_ids] = 0.0
+        self._right_yaw_swing_start_xy[env_ids] = 0.0
+        self._left_yaw_turn_peak[env_ids] = 0.0
+        self._right_yaw_turn_peak[env_ids] = 0.0
+        self._last_yaw_turn_step[env_ids] = 0
 
         self._backward_vel_ema[env_ids] = 0.0
 
