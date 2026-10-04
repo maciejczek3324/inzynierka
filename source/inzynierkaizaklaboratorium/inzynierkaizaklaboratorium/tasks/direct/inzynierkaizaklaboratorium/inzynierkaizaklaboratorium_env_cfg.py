@@ -146,8 +146,10 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     forward_command_max = 0.15
 
     # 15% wylosowanych komend = stanie w miejscu.
-    standing_command_probability = 0.10
-    command_resample_time_s = 10
+    # SIDE OVERNIGHT V4: trochę więcej stand + zmiana komendy w trakcie epizodu.
+    # 5 s daje trening przejść move<->stand bez zmiany 39D obserwacji.
+    standing_command_probability = 0.08
+    command_resample_time_s = 5.0
 
     # Gotowe zakresy na późniejszy etap omnidirectional.
     omni_min_speed = 0.08
@@ -586,11 +588,13 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Przy standing_command_probability = 0.10 daje około:
     # 31.5% side, 29.25% forward, 29.25% backward, 10% stand.
     # W STAGE TURN side zajmuje 30% komend ruchu; yaw ma osobne 35%.
-    side_probability = 0.30
+    # YAW + REPAIR V2: na ten krótki etap wyłączamy SIDE.
+    # SIDE OVERNIGHT V4: główny cel runu, ale zostawiamy miejsce na YAW/F/B/stand.
+    side_probability = 0.60
 
     # Na start małe prędkości, żeby wykorzystać transfer istniejącego gaitu.
-    side_command_min = 0.025
-    side_command_max = 0.045
+    side_command_min = 0.040
+    side_command_max = 0.040
 
     # ============================================================
     # SIDE STEP-TOGETHER ("ODSTAWNO-DOSTAWNY")
@@ -613,10 +617,12 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     side_step_displacement_min = 0.010       # 1 cm: minimalny realny krok w bok
     side_step_displacement_target = 0.035    # 3.5 cm: pełna jakość przesunięcia stopy
 
-    side_min_clearance = 0.010               # 1 cm: stopa musi się realnie oderwać
-    side_clearance_target = 0.025            # 2.5 cm: pełna jakość liftu
+    # OVERNIGHT bootstrap: 6 mm wystarcza do przejścia state-machine z ODSTAW do DOSTAW.
+    # Pełna jakość nadal wymaga wyraźnego liftu (18 mm).
+    side_min_clearance = 0.006
+    side_clearance_target = 0.018
 
-    side_open_width_min = 0.010              # lead foot musi realnie "otworzyć" rozstaw
+    side_open_width_min = 0.005              # REPAIR: 5 mm bootstrap; wcześniej 10 mm blokowało 100% lead-eventów
     side_open_width_target = 0.025           # 2.5 cm dodatkowego rozstawu = pełna jakość
 
     side_close_width_sigma = 0.018           # trailing foot ma wrócić do rozstawu bazowego
@@ -634,7 +640,16 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     side_generic_step_scale = 0.20
 
     rew_scale_side_expected_swing = 3.0
-    rew_scale_side_lead_step = 6.0
+    # W ENV ten reward jest teraz aktywny tylko przy ROBUST single-support,
+    # więc nie płaci już za zwykły double-support.
+    rew_scale_side_expected_support = 1.5
+
+    # PLUS REPAIR V1:
+    # +Y ma odciążyć i realnie oderwać LEWĄ nogę prowadzącą.
+    rew_scale_side_plus_left_lift = 4.0
+
+    rew_scale_side_open_progress = 0.0        # REPAIR: dense sygnał do realnego otwierania rozstawu
+    rew_scale_side_lead_step = 8.0
     rew_scale_side_trail_step = 10.0
     rew_scale_side_fore_aft = -6.0
     rew_scale_side_narrow_stance = -6.0
@@ -667,12 +682,16 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Spośród wszystkich komend RUCHU 35% to czysty obrót.
     # Przy stand=10%, side=30% daje w przybliżeniu:
     # 31.5% yaw, 27% side, 15.75% forward, 15.75% backward, 10% stand.
-    yaw_turn_probability = 0.35
+    # YAW + REPAIR V2:
+    # przy stand=5% daje ok. 76% epizodów PURE YAW,
+    # reszta zostaje na forward/backward dla podtrzymania pamięci.
+    yaw_turn_probability = 0.15
 
     # FINAL TURN STAGE: szybszy, ale nadal rozsądny zakres.
     # 0.25-0.55 rad/s ~= 14.3-31.5 deg/s. PLAY = 0.45 rad/s ~= 25.8 deg/s.
-    yaw_turn_command_min = 0.25
-    yaw_turn_command_max = 0.55
+    # PLUS REPAIR V1: stała komenda ułatwia odkrycie brakującego mirrored skill.
+    yaw_turn_command_min = 0.45
+    yaw_turn_command_max = 0.45
 
     # ------------------------------------------------------------
     # PRAWDZIWY KROK SKRĘTNY
@@ -697,7 +716,26 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
 
     # Same-side repeat zachowuje mały discovery signal, pełna kasa jest
     # za naprzemienny krok.
-    yaw_turn_repeat_scale = 0.15
+    yaw_turn_repeat_scale = 0.02             # REPAIR: prawie zerowy reward za kolejny krok tą samą nogą
+    yaw_turn_dense_repeat_scale = 0.10       # REPAIR: dense arc/twist też preferuje nogę przeciwną do poprzedniej
+
+    yaw_turn_right_arc_boost = 5.0
+    yaw_turn_right_step_boost = 3.0
+
+    # PLUS REPAIR V1:
+    # +yaw ma odciążyć i realnie oderwać PRAWĄ nogę.
+    # Istniejący right_arc_boost przejmie prowadzenie, gdy noga już swingnie.
+    rew_scale_yaw_plus_right_lift = 1.0
+
+    # YAW + REPAIR V2:
+    # signed dense arc od 0 mm. 2 cm = pełny sygnał discovery.
+    yaw_plus_right_arc_discovery_target = 0.015
+    rew_scale_yaw_plus_right_arc_discovery = 8.0
+
+    # YAW + REPAIR V3:
+    # kara tylko za KOLEJNY zaakceptowany krok lewej nogi przy +yaw.
+    # Ma złamać lokalne optimum "kręcę się głównie lewą".
+    rew_scale_yaw_plus_left_repeat_penalty = -1.0
 
     # Dense discovery + real touchdown event + cykl swing/recenter.
     rew_scale_yaw_turn_swing = 2.0
@@ -708,3 +746,37 @@ class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
     # Anty-exploity dla obrotu w miejscu.
     rew_scale_yaw_turn_contact_slip = -8.0
     rew_scale_yaw_turn_translation = -8.0
+
+    # ============================================================
+    # SIDE +Y OVERNIGHT V4 -- reward odporny na contact-flicker
+    # ============================================================
+
+    # Ground drag jest liczony z rzeczywistej prędkości stopy przy ROBUST kontakcie,
+    # a nie z displacementu liczonego od potencjalnie fałszywego liftoff.
+    side_plus_left_ground_drag_speed_target = 0.05
+    rew_scale_side_plus_left_ground_drag = -1.5
+
+    # Absolutny clearance jest tylko małą marchewką; nie chcemy płacić dużo
+    # za samo wiszenie nogą w górze.
+    side_plus_left_clearance_discovery_target = 0.012
+    rew_scale_side_plus_left_clearance_discovery = 6.0
+
+    # Stary boolean ~left_contact został wyłączony: log pokazał reward ~5 mimo
+    # praktycznie zerowego realnego kroku. Zostaje tylko jako debug.
+    rew_scale_side_plus_left_liftoff_discovery = 0.0
+
+    # Główny discovery: dodatnia prędkość Z LEWEJ stopy względem PRAWEJ podpory.
+    # Reward zanika po osiągnięciu 15 mm, żeby nie promować wiecznego unoszenia.
+    side_plus_left_up_velocity_target = 0.08
+    side_plus_left_up_velocity_fade_clearance = 0.015
+    rew_scale_side_plus_left_up_velocity = 8.0
+
+    # Po prawdziwym, filtrowanym single-support przejmują clearance + air-time.
+    side_plus_left_real_swing_target = 0.015
+    rew_scale_side_plus_left_real_swing = 10.0
+
+    # Przy +Y translacja nadal ma gradient, ale pełny tracking/progress dostaje
+    # dopiero wtedy, gdy aktualnie oczekiwana stopa faktycznie się unosi.
+    side_plus_velocity_reward_floor = 0.35
+
+

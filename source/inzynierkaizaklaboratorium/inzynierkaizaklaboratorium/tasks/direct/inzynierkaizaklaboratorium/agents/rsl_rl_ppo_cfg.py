@@ -17,7 +17,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     empirical_normalization = True  # BARDZO WAŻNE: Automatycznie skaluje obserwacje do równych wartości
 
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.80,
+        init_noise_std=0.15,
         # MÓZG ROBOTA: Powiększony do standardów lokomocji (było 32x32)
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
@@ -31,7 +31,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.001,  # ZWIĘKSZONE: Wymusza większą kreatywność w ruchach na początku # zwiększone z 0,006
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-4,
+        learning_rate=3.0e-5,
         schedule="fixed",
         gamma=0.99,
         lam=0.95,

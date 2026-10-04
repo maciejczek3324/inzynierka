@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import math
 import torch
-import numpy as np
+
+import carb
+import omni.appwindow
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
-from isaaclab.devices import Se2Keyboard
+from isaaclab.devices import Se3Gamepad
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import ContactSensor
 
@@ -39,6 +41,67 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             self.num_envs, self.cfg.action_space, device=self.device
         )
         self._previous_actions = torch.zeros_like(self._actions)
+
+        # ============================================================
+        # SIM2REAL STAGE 1 - per-episode elektronika/sensory
+        # ============================================================
+        self._sim2real_active = bool(
+            self.cfg.sim2real_enable
+            and (
+                (not self.cfg.sim2real_training_only)
+                or self.num_envs > 1
+            )
+        )
+
+        self._sim2real_max_action_delay = max(
+            0, int(self.cfg.sim2real_action_delay_max_steps)
+        )
+        self._sim2real_max_obs_delay = max(
+            0, int(self.cfg.sim2real_observation_delay_max_steps)
+        )
+
+        self._sim2real_action_delay_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._sim2real_obs_delay_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
+        self._sim2real_action_buffer = torch.zeros(
+            self.num_envs,
+            self._sim2real_max_action_delay + 1,
+            self.cfg.action_space,
+            device=self.device,
+        )
+        # Sensors delayed here: ang_vel(3) + gravity(3) + q(10) + qd(10) = 26.
+        self._sim2real_sensor_buffer = torch.zeros(
+            self.num_envs,
+            self._sim2real_max_obs_delay + 1,
+            26,
+            device=self.device,
+        )
+        self._sim2real_action_buffer_ready = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._sim2real_sensor_buffer_ready = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+        self._sim2real_motor_scale = torch.ones(
+            self.num_envs, self.cfg.action_space, device=self.device
+        )
+        self._sim2real_motor_zero_offset = torch.zeros_like(
+            self._sim2real_motor_scale
+        )
+        self._sim2real_slew_scale = torch.ones(
+            self.num_envs, 1, device=self.device
+        )
+        self._sim2real_gyro_bias = torch.zeros(
+            self.num_envs, 3, device=self.device
+        )
+        self._sim2real_joint_pos_bias = torch.zeros(
+            self.num_envs, self.cfg.action_space, device=self.device
+        )
 
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
         self._command_timer = torch.zeros(self.num_envs, device=self.device)
@@ -131,28 +194,36 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             self.num_envs, dtype=torch.int8, device=self.device,
         )
 
-        self.keyboard = None
+        # ============================================================
+        # GAMEPAD / PLAY
+        # Lewy drążek = translacja, LT/RT = obrót całej bazy.
+        # ============================================================
+        self.gamepad = None
+        self._gamepad_input = None
+        self._gamepad_device = None
+        self._gamepad_event_sub = None
+        self._gamepad_left_trigger = 0.0
+        self._gamepad_right_trigger = 0.0
 
         if self.num_envs == 1:
-            self.keyboard = Se2Keyboard(
-                v_x_sensitivity=0.12,
-                v_y_sensitivity=0.04,
-                omega_z_sensitivity=0.45,
+            self.gamepad = Se3Gamepad()
+
+            app_window = omni.appwindow.get_default_app_window()
+            self._gamepad_device = app_window.get_gamepad(0)
+            self._gamepad_input = carb.input.acquire_input_interface()
+            self._gamepad_event_sub = (
+                self._gamepad_input.subscribe_to_gamepad_events(
+                    self._gamepad_device,
+                    self._on_gamepad_event,
+                )
             )
 
-            # PLAY keyboard:
-            # UP/DOWN    -> forward/backward
-            # LEFT/RIGHT -> +/-Y
-            # 1/2        -> +/-yaw
-            self.keyboard._INPUT_KEY_MAPPING = {
-                "UP": np.asarray([0.12, 0.0, 0.0], dtype=np.float32),
-                "DOWN": np.asarray([-0.02, 0.0, 0.0], dtype=np.float32),
-                "LEFT": np.asarray([0.0, 0.04, 0.0], dtype=np.float32),
-                "RIGHT": np.asarray([0.0, -0.04, 0.0], dtype=np.float32),
-                "KEY_1": np.asarray([0.0, 0.0, 0.45], dtype=np.float32),
-                "KEY_2": np.asarray([0.0, 0.0, -0.45], dtype=np.float32),
-            }
-            self.keyboard.add_callback("SPACE", self.keyboard.reset)
+            print("\n===================================")
+            print("GAMEPAD CONTROL ACTIVE")
+            print("LEFT STICK : forward/backward/side")
+            print("LT         : turn left")
+            print("RT         : turn right")
+            print("===================================\n")
 
         # ============================================================
         # PAMIĘĆ NATURALNEGO KROKU
@@ -559,9 +630,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "side_heading_error_debug",
                 "side_yaw_command_debug",
                 "side_expected_swing",
-                "side_expected_support",
-                "side_plus_left_lift",
-                "side_open_progress",
                 "side_lead_step",
                 "side_trail_step",
                 "side_fore_aft",
@@ -572,46 +640,9 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "side_lead_displacement_debug",
                 "side_trail_displacement_debug",
 
-                # DIAGNOSTYKA L/P - SIDE (nie wpływa na reward)
-                "side_plus_fraction_debug",
-                "side_minus_fraction_debug",
-                "side_plus_vel_debug",
-                "side_minus_vel_debug",
-                "side_left_lead_event_debug",
-                "side_right_lead_event_debug",
-                "side_left_trail_event_debug",
-                "side_right_trail_event_debug",
-                "side_left_lead_displacement_debug",
-                "side_right_lead_displacement_debug",
-                "side_left_lead_clearance_debug",
-                "side_right_lead_clearance_debug",
-
-                # SIDE GATE PIPELINE - diagnostyka twardych warunków LEAD
-                "side_left_lead_attempt_debug",
-                "side_right_lead_attempt_debug",
-                "side_left_lead_other_contact_ok_debug",
-                "side_right_lead_other_contact_ok_debug",
-                "side_left_lead_clearance_ok_debug",
-                "side_right_lead_clearance_ok_debug",
-                "side_left_lead_displacement_ok_debug",
-                "side_right_lead_displacement_ok_debug",
-                "side_left_lead_open_ok_debug",
-                "side_right_lead_open_ok_debug",
-                "side_left_lead_order_ok_debug",
-                "side_right_lead_order_ok_debug",
-                "side_left_lead_physical_step_debug",
-                "side_right_lead_physical_step_debug",
-                "side_left_lead_max_clearance_event_debug",
-                "side_right_lead_max_clearance_event_debug",
-                "side_left_lead_displacement_event_debug",
-                "side_right_lead_displacement_event_debug",
-
                 # PURE YAW TURN - FINAL STEP/TURN/RECENTER STAGE
                 "yaw_turn_swing",
                 "yaw_turn_swing_twist",
-                "yaw_plus_right_lift",
-                "yaw_plus_right_arc_discovery",
-                "yaw_plus_left_repeat_penalty",
                 "yaw_turn_step",
                 "yaw_turn_stance_twist",
                 "yaw_turn_contact_slip",
@@ -629,42 +660,14 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 "yaw_turn_obrot1_abs_debug",
                 "yaw_turn_obrot2_abs_debug",
 
-                # DIAGNOSTYKA +/- YAW i L/P (nie wpływa na reward)
-                "yaw_plus_fraction_debug",
-                "yaw_minus_fraction_debug",
-                "yaw_plus_rate_debug",
-                "yaw_minus_rate_debug",
-                "yaw_plus_left_step_debug",
-                "yaw_plus_right_step_debug",
-                "yaw_minus_left_step_debug",
-                "yaw_minus_right_step_debug",
-                "yaw_plus_left_arc_debug",
-                "yaw_plus_right_arc_debug",
-                "yaw_minus_left_arc_debug",
-                "yaw_minus_right_arc_debug",
-
-                # YAW GATE/QUALITY PIPELINE - diagnostyka L/P
-                "yaw_left_first_contact_debug",
-                "yaw_right_first_contact_debug",
-                "yaw_left_other_contact_ok_debug",
-                "yaw_right_other_contact_ok_debug",
-                "yaw_left_arc_quality_event_debug",
-                "yaw_right_arc_quality_event_debug",
-                "yaw_left_air_quality_event_debug",
-                "yaw_right_air_quality_event_debug",
-                "yaw_left_lift_quality_event_debug",
-                "yaw_right_lift_quality_event_debug",
-                "yaw_left_peak_quality_event_debug",
-                "yaw_right_peak_quality_event_debug",
-                "yaw_left_direction_quality_event_debug",
-                "yaw_right_direction_quality_event_debug",
-                "side_plus_left_ground_drag",
-                "side_plus_left_clearance_discovery",
-                "side_plus_left_liftoff_discovery",
-                "side_plus_left_up_velocity",
-                "side_plus_left_real_swing",
-                "side_plus_velocity_gate_debug",
-                "side_plus_left_rel_up_vel_debug",
+                # SIM2REAL STAGE 1 diagnostics
+                "sim2real_action_delay_debug",
+                "sim2real_observation_delay_debug",
+                "sim2real_motor_scale_error_debug",
+                "sim2real_motor_zero_offset_debug",
+                "sim2real_slew_scale_error_debug",
+                "sim2real_gyro_bias_debug",
+                "sim2real_joint_pos_bias_debug",
             ]
         }
 
@@ -1041,12 +1044,10 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     + (self.cfg.side_command_max - self.cfg.side_command_min)
                     * torch.rand(len(side_local_ids), device=self.device)
                 )
-                # SIDE OVERNIGHT V4: 70% słabszego +Y / 30% dobrego -Y.
-                # Dłuższy run nie powinien znowu skasować już nauczonej strony.
                 side_sign = torch.where(
-                    torch.rand(len(side_local_ids), device=self.device) < 0.70,
-                    torch.ones(len(side_local_ids), device=self.device),
+                    torch.rand(len(side_local_ids), device=self.device) < 0.5,
                     -torch.ones(len(side_local_ids), device=self.device),
+                    torch.ones(len(side_local_ids), device=self.device),
                 )
                 self._commands[target_env_ids, 1] = side_sign * speed
 
@@ -1062,11 +1063,10 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     + (self.cfg.yaw_turn_command_max - self.cfg.yaw_turn_command_min)
                     * torch.rand(len(yaw_local_ids), device=self.device)
                 )
-                # YAW + REPAIR V2: 90% +yaw, 10% -yaw.
                 yaw_sign = torch.where(
-                    torch.rand(len(yaw_local_ids), device=self.device) < 0.50,
-                    torch.ones(len(yaw_local_ids), device=self.device),
+                    torch.rand(len(yaw_local_ids), device=self.device) < 0.5,
                     -torch.ones(len(yaw_local_ids), device=self.device),
+                    torch.ones(len(yaw_local_ids), device=self.device),
                 )
                 self._commands[target_env_ids, 2] = yaw_sign * yaw_speed
 
@@ -1119,20 +1119,267 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
         self._command_timer[env_ids] = self.cfg.command_resample_time_s
 
-    def _read_keyboard_commands(self):
-        keyboard_command = self.keyboard.advance()
+    @staticmethod
+    def _gamepad_deadzone_rescale(value: float, deadzone: float) -> float:
+        value = float(value)
+        magnitude = abs(value)
 
-        self._commands[:, 0] = keyboard_command[0]
-        self._commands[:, 1] = keyboard_command[1]
-        self._commands[:, 2] = keyboard_command[2]
+        if magnitude <= deadzone:
+            return 0.0
+
+        scaled = (
+            (magnitude - deadzone)
+            / max(1.0 - deadzone, 1.0e-6)
+        )
+
+        return math.copysign(
+            min(max(scaled, 0.0), 1.0),
+            value,
+        )
+
+    def _on_gamepad_event(self, event, *args):
+        # Analogowe triggery nie są częścią 6D polecenia Se3Gamepad,
+        # więc czytamy je bezpośrednio z carb.input.
+        if event.input == carb.input.GamepadInput.LEFT_TRIGGER:
+            self._gamepad_left_trigger = min(
+                max(float(event.value), 0.0),
+                1.0,
+            )
+
+        elif event.input == carb.input.GamepadInput.RIGHT_TRIGGER:
+            self._gamepad_right_trigger = min(
+                max(float(event.value), 0.0),
+                1.0,
+            )
+
+    def _read_gamepad_commands(self):
+        if self.gamepad is None:
+            self._commands.zero_()
+            return
+
+        pad_output = self.gamepad.advance()
+
+        # Kompatybilność z różnymi wersjami Isaac Lab.
+        if isinstance(pad_output, tuple):
+            pad_commands = pad_output[0]
+        else:
+            pad_commands = pad_output
+
+        x_input = self._gamepad_deadzone_rescale(
+            float(pad_commands[0]),
+            self.cfg.gamepad_deadzone,
+        )
+
+        y_input = self._gamepad_deadzone_rescale(
+            float(pad_commands[1]),
+            self.cfg.gamepad_deadzone,
+        )
+
+        lt = self._gamepad_left_trigger
+        rt = self._gamepad_right_trigger
+
+        if lt <= self.cfg.gamepad_trigger_deadzone:
+            lt = 0.0
+        else:
+            lt = (
+                (lt - self.cfg.gamepad_trigger_deadzone)
+                / max(1.0 - self.cfg.gamepad_trigger_deadzone, 1.0e-6)
+            )
+
+        if rt <= self.cfg.gamepad_trigger_deadzone:
+            rt = 0.0
+        else:
+            rt = (
+                (rt - self.cfg.gamepad_trigger_deadzone)
+                / max(1.0 - self.cfg.gamepad_trigger_deadzone, 1.0e-6)
+            )
+
+        # Asymetryczne prędkości zgodne z zakresem treningowym.
+        if x_input >= 0.0:
+            cmd_x = x_input * self.cfg.gamepad_forward_speed
+        else:
+            cmd_x = x_input * self.cfg.gamepad_backward_speed
+
+        cmd_y = y_input * self.cfg.gamepad_side_speed
+
+        # +yaw = obrót w lewo, -yaw = obrót w prawo.
+        # LT = lewo, RT = prawo.
+        cmd_yaw = (
+            (lt - rt)
+            * self.cfg.gamepad_yaw_rate
+        )
+
+        translation_active = (
+            abs(cmd_x) > self.cfg.command_move_threshold
+            or abs(cmd_y) > self.cfg.command_move_threshold
+        )
+
+        yaw_active = (
+            abs(cmd_yaw) > self.cfg.command_move_threshold
+        )
+
+        # Obecna policy była uczona na osobnych trybach:
+        # translacja ALBO pure-yaw.
+        # Dlatego na pierwsze testy nie mieszamy jeszcze yaw z chodzeniem.
+        if self.cfg.gamepad_pure_modes_only:
+            if translation_active:
+                cmd_yaw = 0.0
+            elif yaw_active:
+                cmd_x = 0.0
+                cmd_y = 0.0
+
+        self._commands[:, 0] = cmd_x
+        self._commands[:, 1] = cmd_y
+        self._commands[:, 2] = cmd_yaw
+
+    def _sample_sim2real_episode_params(self, env_ids: torch.Tensor):
+        """Losuje łagodne, stałe przez epizod różnice elektroniki/sensorów."""
+        if len(env_ids) == 0:
+            return
+
+        n = len(env_ids)
+
+        # Zawsze czyścimy historię opóźnień po resecie.
+        self._sim2real_action_buffer[env_ids] = 0.0
+        self._sim2real_sensor_buffer[env_ids] = 0.0
+        self._sim2real_action_buffer_ready[env_ids] = False
+        self._sim2real_sensor_buffer_ready[env_ids] = False
+
+        if not self._sim2real_active:
+            self._sim2real_action_delay_steps[env_ids] = 0
+            self._sim2real_obs_delay_steps[env_ids] = 0
+            self._sim2real_motor_scale[env_ids] = 1.0
+            self._sim2real_motor_zero_offset[env_ids] = 0.0
+            self._sim2real_slew_scale[env_ids] = 1.0
+            self._sim2real_gyro_bias[env_ids] = 0.0
+            self._sim2real_joint_pos_bias[env_ids] = 0.0
+            return
+
+        # ------------------------------------------------------------
+        # Delay: większość środowisk nadal ma 0, część ma 1 control step.
+        # ------------------------------------------------------------
+        if self._sim2real_max_action_delay > 0:
+            delayed = (
+                torch.rand(n, device=self.device)
+                < self.cfg.sim2real_action_delay_probability
+            )
+            sampled = torch.randint(
+                1,
+                self._sim2real_max_action_delay + 1,
+                (n,),
+                device=self.device,
+            )
+            self._sim2real_action_delay_steps[env_ids] = torch.where(
+                delayed, sampled, torch.zeros_like(sampled)
+            )
+        else:
+            self._sim2real_action_delay_steps[env_ids] = 0
+
+        if self._sim2real_max_obs_delay > 0:
+            delayed = (
+                torch.rand(n, device=self.device)
+                < self.cfg.sim2real_observation_delay_probability
+            )
+            sampled = torch.randint(
+                1,
+                self._sim2real_max_obs_delay + 1,
+                (n,),
+                device=self.device,
+            )
+            self._sim2real_obs_delay_steps[env_ids] = torch.where(
+                delayed, sampled, torch.zeros_like(sampled)
+            )
+        else:
+            self._sim2real_obs_delay_steps[env_ids] = 0
+
+        # ------------------------------------------------------------
+        # Servo / sterownik - stałe różnice przez cały epizod.
+        # ------------------------------------------------------------
+        self._sim2real_motor_scale[env_ids] = (
+            self.cfg.sim2real_motor_scale_min
+            + (
+                self.cfg.sim2real_motor_scale_max
+                - self.cfg.sim2real_motor_scale_min
+            )
+            * torch.rand(
+                n, self.cfg.action_space, device=self.device
+            )
+        )
+
+        self._sim2real_motor_zero_offset[env_ids] = (
+            2.0
+            * torch.rand(
+                n, self.cfg.action_space, device=self.device
+            )
+            - 1.0
+        ) * self.cfg.sim2real_motor_zero_offset_max
+
+        self._sim2real_slew_scale[env_ids] = (
+            self.cfg.sim2real_slew_scale_min
+            + (
+                self.cfg.sim2real_slew_scale_max
+                - self.cfg.sim2real_slew_scale_min
+            )
+            * torch.rand(n, 1, device=self.device)
+        )
+
+        # ------------------------------------------------------------
+        # Biasy sensorów - stałe w epizodzie.
+        # ------------------------------------------------------------
+        self._sim2real_gyro_bias[env_ids] = (
+            2.0 * torch.rand(n, 3, device=self.device) - 1.0
+        ) * self.cfg.sim2real_gyro_bias_max
+
+        self._sim2real_joint_pos_bias[env_ids] = (
+            2.0
+            * torch.rand(
+                n, self.cfg.action_space, device=self.device
+            )
+            - 1.0
+        ) * self.cfg.sim2real_joint_pos_bias_max
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._previous_actions = self._actions.clone()
         self._actions = torch.clamp(actions.clone(), min=-1.0, max=1.0)
 
-        # PLAY: odczytaj klawiaturę PRZED pure_yaw_scale_mask.
-        if self.num_envs == 1 and self.keyboard is not None:
-            self._read_keyboard_commands()
+        # PLAY: czytamy pada PRZED obliczeniem pure_yaw_scale_mask.
+        # Dzięki temu LT/RT od razu aktywuje większy zakres obrot1/obrot2.
+        if self.num_envs == 1 and self.gamepad is not None:
+            self._read_gamepad_commands()
+
+        # ============================================================
+        # SIM2REAL: opóźnienie komendy do napędów.
+        # _actions pozostaje bieżącą komendą policy (i nadal trafia do obs).
+        # Tylko fizyczny target korzysta z opóźnionej kopii.
+        # ============================================================
+        control_actions = self._actions
+
+        if self._sim2real_active:
+            not_ready = ~self._sim2real_action_buffer_ready
+            if torch.any(not_ready):
+                first_action = self._actions[not_ready].unsqueeze(1).expand(
+                    -1, self._sim2real_max_action_delay + 1, -1
+                )
+                self._sim2real_action_buffer[not_ready] = first_action
+                self._sim2real_action_buffer_ready[not_ready] = True
+
+            if self._sim2real_max_action_delay > 0:
+                self._sim2real_action_buffer[:, 1:] = (
+                    self._sim2real_action_buffer[:, :-1].clone()
+                )
+            self._sim2real_action_buffer[:, 0] = self._actions
+
+            env_arange = torch.arange(
+                self.num_envs, device=self.device
+            )
+            control_actions = self._sim2real_action_buffer[
+                env_arange, self._sim2real_action_delay_steps
+            ]
+
+            # Kalibracja/zakres napędu różny dla każdej osi.
+            control_actions = (
+                control_actions * self._sim2real_motor_scale
+            )
 
         action_scale = torch.full_like(
             self._actions,
@@ -1146,15 +1393,20 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         # Tylko przy PURE YAW odblokowujemy większy zakres, dzięki czemu
         # nie zmieniamy od razu mechaniki forward/backward/side.
         # ============================================================
+        # pure_yaw_scale_mask = (
+        #     (
+        #         torch.norm(self._commands[:, :2], dim=1)
+        #         <= self.cfg.command_move_threshold
+        #     )
+        #     & (
+        #         torch.abs(self._commands[:, 2])
+        #         > self.cfg.command_move_threshold
+        #     )
+        # )
+
         pure_yaw_scale_mask = (
-            (
-                torch.norm(self._commands[:, :2], dim=1)
-                <= self.cfg.command_move_threshold
-            )
-            & (
                 torch.abs(self._commands[:, 2])
                 > self.cfg.command_move_threshold
-            )
         )
 
         turn_action_scale = torch.where(
@@ -1174,7 +1426,8 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
         desired_targets = (
                 self._robot.data.default_joint_pos
-                + action_scale * self._actions
+                + action_scale * control_actions
+                + self._sim2real_motor_zero_offset
         )
 
         # Bazowo zachowujemy stare wygładzanie targetów.
@@ -1205,17 +1458,23 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             + (1.0 - filter_alpha) * self._current_targets
         )
 
-        max_target_delta = 5.24 * self.step_dt
+        # Realne serwa nie mają identycznej prędkości / napięcia zasilania.
+        max_target_delta = (
+            5.24 * self.step_dt * self._sim2real_slew_scale
+        )
 
-        target_delta = torch.clamp(
-            filtered_targets - self._current_targets,
-            min=-max_target_delta,
-            max=max_target_delta,
+        raw_target_delta = filtered_targets - self._current_targets
+        target_delta = torch.maximum(
+            torch.minimum(raw_target_delta, max_target_delta),
+            -max_target_delta,
         )
 
         self._current_targets = self._current_targets + target_delta
 
-        if self.num_envs > 1:
+        if self.num_envs == 1:
+            # PLAY: komenda jest już ustawiona przez pada.
+            pass
+        else:
             self._command_timer -= self.step_dt
 
             resample_ids = torch.nonzero(
@@ -1359,14 +1618,82 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self._current_targets)
 
     def _get_observations(self) -> dict:
+        root_ang_vel = self._robot.data.root_ang_vel_b
+        projected_gravity = self._robot.data.projected_gravity_b
+        joint_pos_rel = (
+            self._robot.data.joint_pos
+            - self._robot.data.default_joint_pos
+        )
+        joint_vel = self._robot.data.joint_vel
+
+        if self._sim2real_active:
+            # Stały bias + biały noise. Reward nadal korzysta z czystego stanu.
+            root_ang_vel = (
+                root_ang_vel
+                + self._sim2real_gyro_bias
+                + torch.randn_like(root_ang_vel)
+                * self.cfg.sim2real_gyro_noise_std
+            )
+            projected_gravity = (
+                projected_gravity
+                + torch.randn_like(projected_gravity)
+                * self.cfg.sim2real_gravity_noise_std
+            )
+            joint_pos_rel = (
+                joint_pos_rel
+                + self._sim2real_joint_pos_bias
+                + torch.randn_like(joint_pos_rel)
+                * self.cfg.sim2real_joint_pos_noise_std
+            )
+            joint_vel = (
+                joint_vel
+                + torch.randn_like(joint_vel)
+                * self.cfg.sim2real_joint_vel_noise_std
+            )
+
+            sensor_now = torch.cat(
+                [
+                    root_ang_vel,
+                    projected_gravity,
+                    joint_pos_rel,
+                    joint_vel,
+                ],
+                dim=-1,
+            )
+
+            not_ready = ~self._sim2real_sensor_buffer_ready
+            if torch.any(not_ready):
+                first_sensor = sensor_now[not_ready].unsqueeze(1).expand(
+                    -1, self._sim2real_max_obs_delay + 1, -1
+                )
+                self._sim2real_sensor_buffer[not_ready] = first_sensor
+                self._sim2real_sensor_buffer_ready[not_ready] = True
+
+            if self._sim2real_max_obs_delay > 0:
+                self._sim2real_sensor_buffer[:, 1:] = (
+                    self._sim2real_sensor_buffer[:, :-1].clone()
+                )
+            self._sim2real_sensor_buffer[:, 0] = sensor_now
+
+            env_arange = torch.arange(
+                self.num_envs, device=self.device
+            )
+            delayed_sensor = self._sim2real_sensor_buffer[
+                env_arange, self._sim2real_obs_delay_steps
+            ]
+
+            root_ang_vel = delayed_sensor[:, 0:3]
+            projected_gravity = delayed_sensor[:, 3:6]
+            joint_pos_rel = delayed_sensor[:, 6:16]
+            joint_vel = delayed_sensor[:, 16:26]
+
         obs = torch.cat(
             [
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
+                root_ang_vel,
+                projected_gravity,
                 self._commands,
-                self._robot.data.joint_pos
-                - self._robot.data.default_joint_pos,
-                self._robot.data.joint_vel,
+                joint_pos_rel,
+                joint_vel,
                 self._actions,
             ],
             dim=-1,
@@ -2662,52 +2989,27 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             max=1.0,
         )
 
-        # SIDE OVERNIGHT V4: kontakt filtrowany historią siły, tak jak w
-        # typowych rewardach feet_slide. Pojedynczy zanik current_contact_time
-        # nie może już udawać poprawnego swingu.
-        left_side_single_support_robust = (~left_contact_bw) & right_contact_bw
-        right_side_single_support_robust = (~right_contact_bw) & left_contact_bw
-
         # Dense reward tylko dla stopy, której TERAZ oczekujemy.
         side_expected_swing = (
                 side_expect_left_lead.float()
-                * left_side_single_support_robust.float()
+                * left_swing.float()
                 * left_side_air_quality
                 * left_side_displacement_quality
 
                 + side_expect_right_lead.float()
-                * right_side_single_support_robust.float()
+                * right_swing.float()
                 * right_side_air_quality
                 * right_side_displacement_quality
 
                 + side_expect_left_trail.float()
-                * left_side_single_support_robust.float()
+                * left_swing.float()
                 * left_side_air_quality
                 * left_side_displacement_quality
 
                 + side_expect_right_trail.float()
-                * right_side_single_support_robust.float()
+                * right_swing.float()
                 * right_side_air_quality
                 * right_side_displacement_quality
-        )
-
-        # Support reward NIE płaci już za samo stanie na obu stopach.
-        # Dostajemy go tylko w prawdziwym, filtrowanym single-support.
-        side_expected_support = (
-                side_cmd_gate
-                * (
-                        side_expect_left_lead.float()
-                        * left_side_single_support_robust.float()
-
-                        + side_expect_right_lead.float()
-                        * right_side_single_support_robust.float()
-
-                        + side_expect_left_trail.float()
-                        * left_side_single_support_robust.float()
-
-                        + side_expect_right_trail.float()
-                        * right_side_single_support_robust.float()
-                )
         )
 
         side_lead_displacement_debug = (
@@ -3596,188 +3898,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         )
 
         double_support = left_contact & right_contact
-
-        # ============================================================
-        # PLUS REPAIR V1
-        #
-        # Brakujące mirrored skills z PLAY/logów:
-        #   SIDE +Y -> LEWA noga ma się realnie odciążyć i oderwać.
-        #   YAW  +  -> PRAWA noga ma się realnie odciążyć i oderwać.
-        #
-        # 25% sygnału to PRE-LIFT (przeniesienie ciężaru na podporę),
-        # 75% to prawdziwy single-support + clearance.
-        #
-        # Dzięki PRE-LIFT reward nie jest martwy, kiedy stopa jeszcze
-        # w ogóle nie potrafi stracić kontaktu.
-        # ============================================================
-
-        left_load_share = left_contact_force / total_contact_force
-        right_load_share = right_contact_force / total_contact_force
-
-        # SIDE +Y: LEWA ma być lead, więc najpierw obciążamy PRAWĄ.
-        side_plus_left_pre_lift = torch.clamp(
-            (right_load_share - 0.50) / 0.35,
-            min=0.0,
-            max=1.0,
-        )
-        side_plus_left_lift_quality = torch.clamp(
-            left_clearance / self.cfg.side_clearance_target,
-            min=0.0,
-            max=1.0,
-        )
-        side_plus_left_lift = (
-            side_expect_left_lead.float()
-            * (
-                0.10
-                * double_support.float()
-                * side_plus_left_pre_lift
-
-                + 0.90
-                * left_swing.float()
-                * side_plus_left_lift_quality
-            )
-        )
-        # ============================================================
-        # SIDE +Y OVERNIGHT V4 -- anti-hack lift discovery
-        # ============================================================
-        # Isaac world Z jest skierowane do góry (gravity = -Z).
-        # Używamy prędkości LEWEJ stopy względem PRAWEJ, dzięki czemu
-        # podskok całego korpusu nie daje darmowego rewardu.
-        foot_vel_l_w = self._robot.data.body_lin_vel_w[:, self.stopa_l_idx, :]
-        foot_vel_r_w = self._robot.data.body_lin_vel_w[:, self.stopa_r_idx, :]
-        left_rel_up_vel = foot_vel_l_w[:, 2] - foot_vel_r_w[:, 2]
-
-        side_plus_left_up_velocity = (
-                side_expect_left_lead.float()
-                * right_contact_bw.float()
-                * torch.clamp(
-                    left_rel_up_vel / self.cfg.side_plus_left_up_velocity_target,
-                    min=0.0, max=1.0,
-                )
-                * torch.clamp(
-                    1.0
-                    - left_clearance
-                    / self.cfg.side_plus_left_up_velocity_fade_clearance,
-                    min=0.0, max=1.0,
-                )
-        )
-
-        # Mały absolutny clearance discovery. Waga jest celowo niska,
-        # żeby agent nie zarabiał przez samo trzymanie nogi w powietrzu.
-        side_plus_left_clearance_discovery = (
-                side_expect_left_lead.float()
-                * right_contact_bw.float()
-                * torch.clamp(
-                    left_clearance
-                    / self.cfg.side_plus_left_clearance_discovery_target,
-                    min=0.0, max=1.0,
-                )
-        )
-
-        # Prawdziwy discovery po odklejeniu: robust single-support + air-time
-        # + rzeczywisty clearance. Contact flicker sam tego nie spełni.
-        side_plus_left_real_swing = (
-                side_expect_left_lead.float()
-                * left_side_single_support_robust.float()
-                * left_side_air_quality
-                * torch.clamp(
-                    left_clearance / self.cfg.side_plus_left_real_swing_target,
-                    min=0.0, max=1.0,
-                )
-        )
-
-        # Stary sygnał zostaje WYŁĄCZNIE jako debug (waga w cfg = 0).
-        side_plus_left_liftoff_discovery = (
-                side_expect_left_lead.float()
-                * (~left_contact).float()
-                * right_contact.float()
-        )
-
-        # Kara za prawdziwy ruch LEWEJ stopy po podłożu przy robust kontakcie.
-        # Nie korzystamy już ze stalego displacementu od fałszywego liftoff.
-        left_foot_planar_speed = torch.norm(foot_vel_l_w[:, :2], dim=1)
-        side_plus_left_ground_drag = (
-                side_expect_left_lead.float()
-                * left_contact_bw.float()
-                * torch.clamp(
-                    left_foot_planar_speed
-                    / self.cfg.side_plus_left_ground_drag_speed_target,
-                    min=0.0, max=1.0,
-                )
-        )
-
-        # Przy +Y nie pozwalamy zdobywać pełnego velocity/progress przez shuffle.
-        # Faza LEAD patrzy na clearance lewej, faza TRAIL na clearance prawej.
-        side_plus_expected_lift_quality = (
-                side_expect_left_lead.float()
-                * torch.clamp(
-                    left_clearance / self.cfg.side_plus_left_clearance_discovery_target,
-                    min=0.0, max=1.0,
-                )
-                + side_expect_right_trail.float()
-                * torch.clamp(
-                    right_clearance / self.cfg.side_plus_left_clearance_discovery_target,
-                    min=0.0, max=1.0,
-                )
-        )
-        side_plus_velocity_reward_gate = (
-                1.0
-                - side_plus.float()
-                + side_plus.float()
-                * (
-                    self.cfg.side_plus_velocity_reward_floor
-                    + (1.0 - self.cfg.side_plus_velocity_reward_floor)
-                    * side_plus_expected_lift_quality
-                )
-        )
-
-        # YAW +: brakujący krok robi PRAWA noga,
-        # więc najpierw obciążamy LEWĄ podporę.
-        yaw_plus_gate = (
-            yaw_turn_cmd_gate
-            * (self._commands[:, 2] > 0.0).float()
-        )
-        yaw_plus_right_pre_lift = torch.clamp(
-            (left_load_share - 0.50) / 0.35,
-            min=0.0,
-            max=1.0,
-        )
-        yaw_plus_right_lift_quality = torch.clamp(
-            right_clearance / self.cfg.yaw_turn_lift_target,
-            min=0.0,
-            max=1.0,
-        )
-        yaw_plus_right_lift = (
-            yaw_plus_gate
-            * (
-                0.25
-                * double_support.float()
-                * yaw_plus_right_pre_lift
-
-                + 0.75
-                * right_swing.float()
-                * yaw_plus_right_lift_quality
-            )
-        )
-
-        # YAW + REPAIR V2:
-        # Prawa noga już potrafi się odrywać, ale nie robi właściwego łuku.
-        # Ten sygnał działa OD 0 mm, bez starego deadbandu 6 mm:
-        #   > 0  -> prawa stopa idzie we właściwy (+X) łuk dla +yaw
-        #   < 0  -> prawa stopa idzie w złą stronę i dostaje karę
-        # Reward działa tylko podczas prawdziwego swingu prawej nogi,
-        # gdy lewa pozostaje podporą.
-        yaw_plus_right_arc_discovery = (
-            yaw_plus_gate
-            * right_swing.float()
-            * left_contact.float()
-            * torch.clamp(
-                right_yaw_signed_arc
-                / self.cfg.yaw_plus_right_arc_discovery_target,
-                min=-1.0,
-                max=1.0,
-            )
-        )
 
         # ============================================================
         # PRE-SWING: PRZENIESIENIE CIĘŻARU
@@ -4809,15 +4929,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             >= self.cfg.side_open_width_min
         )
 
-        # Dense bootstrap otwierania rozstawu podczas fazy LEAD.
-        # Dotychczas side_open_valid było praktycznie zawsze false,
-        # więc state machine nie mogła przejść do DOSTAW.
-        side_open_progress = (
-            side_cmd_gate
-            * (self._side_phase == 0).float()
-            * side_open_quality
-        )
-
         # DOSTAW ma wrócić do normalnego rozstawu, ale bez krzyżowania.
         side_close_error = torch.abs(
             side_stance_width
@@ -4837,22 +4948,26 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         side_lead_left_event = (
                 side_expect_left_lead
                 & left_side_physical_step
+                & side_open_valid
                 & side_order_ok
         )
         side_lead_right_event = (
                 side_expect_right_lead
                 & right_side_physical_step
+                & side_open_valid
                 & side_order_ok
         )
 
         side_trail_left_event = (
                 side_expect_left_trail
                 & left_side_physical_step
+                & side_close_valid
                 & side_order_ok
         )
         side_trail_right_event = (
                 side_expect_right_trail
                 & right_side_physical_step
+                & side_close_valid
                 & side_order_ok
         )
 
@@ -4862,6 +4977,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * left_step_time_quality
                 * left_side_clearance_quality
                 * left_side_displacement_quality
+                * side_open_quality
                 * side_fore_aft_quality
                 * side_order_ok.float()
 
@@ -4870,6 +4986,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * right_step_time_quality
                 * right_side_clearance_quality
                 * right_side_displacement_quality
+                * side_open_quality
                 * side_fore_aft_quality
                 * side_order_ok.float()
         )
@@ -4880,6 +4997,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * left_step_time_quality
                 * left_side_clearance_quality
                 * left_side_displacement_quality
+                * side_close_quality
                 * side_fore_aft_quality
                 * side_order_ok.float()
 
@@ -4888,6 +5006,7 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * right_step_time_quality
                 * right_side_clearance_quality
                 * right_side_displacement_quality
+                * side_close_quality
                 * side_fore_aft_quality
                 * side_order_ok.float()
         )
@@ -5729,30 +5848,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             min=0.0, max=1.0,
         )
 
-        # Jeśli poprzedni zaakceptowany krok był lewy, kolejne lewe
-        # swingi dostają tylko mały dense reward; prawa noga dostaje pełny.
-        # Analogicznie po prawej. To usuwa loophole "kręcę prawie tylko lewą".
-        yaw_left_dense_weight = torch.where(
-            self._last_yaw_turn_step == -1,
-            torch.full_like(yaw_turn_cmd_gate, self.cfg.yaw_turn_dense_repeat_scale),
-            torch.ones_like(yaw_turn_cmd_gate),
-        )
-        yaw_right_dense_weight = torch.where(
-            self._last_yaw_turn_step == 1,
-            torch.full_like(yaw_turn_cmd_gate, self.cfg.yaw_turn_dense_repeat_scale),
-            torch.ones_like(yaw_turn_cmd_gate),
-        )
-
         yaw_turn_swing_twist = (
             yaw_turn_cmd_gate
             * (
-                left_swing.float()
-                * left_turn_twist_quality
-                * yaw_left_dense_weight
-
-                + right_swing.float()
-                * right_turn_twist_quality
-                * yaw_right_dense_weight
+                left_swing.float() * left_turn_twist_quality
+                + right_swing.float() * right_turn_twist_quality
             )
             * (0.20 + 0.80 * yaw_turn_direction_quality)
         )
@@ -5792,14 +5892,8 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         # Nie płacimy już tylko za "mam jedną nogę w powietrzu".
         # ------------------------------------------------------------
         yaw_turn_active_arc_quality = (
-            left_swing.float()
-            * left_yaw_arc_quality
-            * yaw_left_dense_weight
-
-            + right_swing.float()
-            * right_yaw_arc_quality
-            * yaw_right_dense_weight
-            * self.cfg.yaw_turn_right_arc_boost
+            left_swing.float() * left_yaw_arc_quality
+            + right_swing.float() * right_yaw_arc_quality
         )
         yaw_turn_swing = (
             yaw_turn_cmd_gate
@@ -5886,26 +5980,12 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             torch.ones_like(right_yaw_real_step),
         )
 
-        # YAW + REPAIR V3:
-        # Jeśli policy dalej kręci +yaw kolejnymi krokami LEWEJ nogi,
-        # dostaje karę. Pierwszy/naprzemienny krok lewej nogi nie jest karany.
-        # Kara znika automatycznie, gdy prawa noga zacznie robić zaakceptowane kroki.
-        yaw_plus_left_repeat_penalty = (
-            yaw_plus_gate
-            * left_yaw_real_step
-            * left_yaw_repeat.float()
-        )
-
         yaw_turn_step = (
-                yaw_turn_cmd_gate
-                * (
-                        left_yaw_real_step
-                        * left_yaw_step_weight
-
-                        + right_yaw_real_step
-                        * right_yaw_step_weight
-                        * self.cfg.yaw_turn_right_step_boost
-                )
+            yaw_turn_cmd_gate
+            * (
+                left_yaw_real_step * left_yaw_step_weight
+                + right_yaw_real_step * right_yaw_step_weight
+            )
         )
 
         yaw_turn_repeat_debug = (
@@ -5959,10 +6039,10 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         side_contact_slip = (
                 side_cmd_gate
                 * (
-                        left_contact_bw.float()
+                        left_contact.float()
                         * torch.norm(vel_l_xy, dim=1)
                         +
-                        right_contact_bw.float()
+                        right_contact.float()
                         * torch.norm(vel_r_xy, dim=1)
                 )
         )
@@ -6550,7 +6630,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * track_lin_vel_xy
                 * support_reward_gate
                 * non_backward_gate
-                * side_plus_velocity_reward_gate
                 * dt
             ),
             "track_yaw_vel": (
@@ -6599,21 +6678,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * side_expected_swing
                 * self.step_dt
             ),
-            "side_expected_support": (
-                self.cfg.rew_scale_side_expected_support
-                * side_expected_support
-                * self.step_dt
-            ),
-            "side_plus_left_lift": (
-                self.cfg.rew_scale_side_plus_left_lift
-                * side_plus_left_lift
-                * self.step_dt
-            ),
-            "side_open_progress": (
-                self.cfg.rew_scale_side_open_progress
-                * side_open_progress
-                * self.step_dt
-            ),
             "side_lead_step": (
                 self.cfg.rew_scale_side_lead_step
                 * side_lead_step
@@ -6640,21 +6704,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             "yaw_turn_swing_twist": (
                 self.cfg.rew_scale_yaw_turn_swing_twist
                 * yaw_turn_swing_twist
-                * self.step_dt
-            ),
-            "yaw_plus_right_lift": (
-                self.cfg.rew_scale_yaw_plus_right_lift
-                * yaw_plus_right_lift
-                * self.step_dt
-            ),
-            "yaw_plus_right_arc_discovery": (
-                self.cfg.rew_scale_yaw_plus_right_arc_discovery
-                * yaw_plus_right_arc_discovery
-                * self.step_dt
-            ),
-            "yaw_plus_left_repeat_penalty": (
-                self.cfg.rew_scale_yaw_plus_left_repeat_penalty
-                * yaw_plus_left_repeat_penalty
                 * self.step_dt
             ),
             "yaw_turn_step": (
@@ -6701,7 +6750,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * bias_progress_gate
                 * roll_progress_gate
                 * backward_progress_reward_gate
-                * side_plus_velocity_reward_gate
                 * self.step_dt,
             "swing_knee_flex": (
                     self.cfg.rew_scale_swing_knee_flex
@@ -7057,31 +7105,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                     * backward_world_lateral_penalty
                     * self.step_dt
             ),
-            "side_plus_left_ground_drag": (
-                    self.cfg.rew_scale_side_plus_left_ground_drag
-                    * side_plus_left_ground_drag
-                    * self.step_dt
-            ),
-            "side_plus_left_clearance_discovery": (
-                    self.cfg.rew_scale_side_plus_left_clearance_discovery
-                    * side_plus_left_clearance_discovery
-                    * self.step_dt
-            ),
-            "side_plus_left_liftoff_discovery": (
-                    self.cfg.rew_scale_side_plus_left_liftoff_discovery
-                    * side_plus_left_liftoff_discovery
-                    * self.step_dt
-            ),
-            "side_plus_left_up_velocity": (
-                    self.cfg.rew_scale_side_plus_left_up_velocity
-                    * side_plus_left_up_velocity
-                    * self.step_dt
-            ),
-            "side_plus_left_real_swing": (
-                    self.cfg.rew_scale_side_plus_left_real_swing
-                    * side_plus_left_real_swing
-                    * self.step_dt
-            ),
 
         }
 
@@ -7090,18 +7113,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
 
         for key, value in rewards.items():
             self._episode_sums[key] += value
-
-        self._episode_sums["side_plus_velocity_gate_debug"] += (
-                side_plus_velocity_reward_gate
-                * side_plus.float()
-                * self.step_dt
-        )
-        self._episode_sums["side_plus_left_rel_up_vel_debug"] += (
-                torch.clamp(left_rel_up_vel, min=-0.50, max=0.50)
-                * side_expect_left_lead.float()
-                * self.step_dt
-        )
-
         self._episode_sums["single_support_debug"] += (
                 single_support_debug * self.step_dt
         )
@@ -7444,189 +7455,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * self.step_dt
         )
 
-        # ------------------------------------------------------------
-        # DIAGNOSTYKA SIDE: rozdzielenie +Y / -Y oraz lewej / prawej nogi.
-        # TYLKO LOGI - żadna z tych wartości nie wchodzi do rewardu.
-        # ------------------------------------------------------------
-        self._episode_sums["side_plus_fraction_debug"] += (
-                side_plus.float() * self.step_dt
-        )
-        self._episode_sums["side_minus_fraction_debug"] += (
-                side_minus.float() * self.step_dt
-        )
-
-        # vel_along_cmd ma dodatni znak, gdy ruch jest zgodny z komendą,
-        # niezależnie od tego czy komenda to +Y czy -Y.
-        self._episode_sums["side_plus_vel_debug"] += (
-                vel_along_cmd * side_plus.float() * self.step_dt
-        )
-        self._episode_sums["side_minus_vel_debug"] += (
-                vel_along_cmd * side_minus.float() * self.step_dt
-        )
-
-        # Zaakceptowane fizyczne eventy ODSTAW/DOSTAW - raportowane jako eventy/s.
-        self._episode_sums["side_left_lead_event_debug"] += (
-                side_lead_left_event.float()
-        )
-        self._episode_sums["side_right_lead_event_debug"] += (
-                side_lead_right_event.float()
-        )
-        self._episode_sums["side_left_trail_event_debug"] += (
-                side_trail_left_event.float()
-        )
-        self._episode_sums["side_right_trail_event_debug"] += (
-                side_trail_right_event.float()
-        )
-
-        # Jak daleko i jak wysoko idzie noga prowadząca dla każdej strony.
-        self._episode_sums["side_left_lead_displacement_debug"] += (
-                torch.clamp(left_side_displacement, min=0.0)
-                * side_expect_left_lead.float()
-                * self.step_dt
-        )
-        self._episode_sums["side_right_lead_displacement_debug"] += (
-                torch.clamp(right_side_displacement, min=0.0)
-                * side_expect_right_lead.float()
-                * self.step_dt
-        )
-        self._episode_sums["side_left_lead_clearance_debug"] += (
-                left_clearance
-                * side_expect_left_lead.float()
-                * self.step_dt
-        )
-        self._episode_sums["side_right_lead_clearance_debug"] += (
-                right_clearance
-                * side_expect_right_lead.float()
-                * self.step_dt
-        )
-
-        # ------------------------------------------------------------
-        # SIDE GATE PIPELINE
-        #
-        # Liczymy tylko momenty touchdown nogi, która ma być LEAD.
-        # Dzięki temu z logu można policzyć procent przejścia każdego
-        # twardego warunku i znaleźć dokładnie gate, który zabija event.
-        # TYLKO DIAGNOSTYKA - zero wpływu na reward/policy.
-        # ------------------------------------------------------------
-        side_left_lead_attempt = (
-            side_expect_left_lead & left_touchdown
-        )
-        side_right_lead_attempt = (
-            side_expect_right_lead & right_touchdown
-        )
-
-        side_left_lead_other_contact_ok = (
-            side_left_lead_attempt & right_contact
-        )
-        side_right_lead_other_contact_ok = (
-            side_right_lead_attempt & left_contact
-        )
-
-        # Uwaga: _left/_right_max_clearance są niżej resetowane po touchdown.
-        # Korzystamy więc z jakości policzonej WCZEŚNIEJ, przed resetem.
-        side_clearance_min_quality = (
-            self.cfg.side_min_clearance
-            / max(self.cfg.side_clearance_target, 1.0e-6)
-        )
-        side_left_lead_clearance_ok = (
-            side_left_lead_attempt
-            & (left_side_clearance_quality >= side_clearance_min_quality)
-        )
-        side_right_lead_clearance_ok = (
-            side_right_lead_attempt
-            & (right_side_clearance_quality >= side_clearance_min_quality)
-        )
-
-        side_left_lead_displacement_ok = (
-            side_left_lead_attempt
-            & (left_side_displacement >= self.cfg.side_step_displacement_min)
-        )
-        side_right_lead_displacement_ok = (
-            side_right_lead_attempt
-            & (right_side_displacement >= self.cfg.side_step_displacement_min)
-        )
-
-        side_left_lead_open_ok = (
-            side_left_lead_attempt & side_open_valid
-        )
-        side_right_lead_open_ok = (
-            side_right_lead_attempt & side_open_valid
-        )
-
-        side_left_lead_order_ok = (
-            side_left_lead_attempt & side_order_ok
-        )
-        side_right_lead_order_ok = (
-            side_right_lead_attempt & side_order_ok
-        )
-
-        self._episode_sums["side_left_lead_attempt_debug"] += (
-            side_left_lead_attempt.float()
-        )
-        self._episode_sums["side_right_lead_attempt_debug"] += (
-            side_right_lead_attempt.float()
-        )
-
-        self._episode_sums["side_left_lead_other_contact_ok_debug"] += (
-            side_left_lead_other_contact_ok.float()
-        )
-        self._episode_sums["side_right_lead_other_contact_ok_debug"] += (
-            side_right_lead_other_contact_ok.float()
-        )
-
-        self._episode_sums["side_left_lead_clearance_ok_debug"] += (
-            side_left_lead_clearance_ok.float()
-        )
-        self._episode_sums["side_right_lead_clearance_ok_debug"] += (
-            side_right_lead_clearance_ok.float()
-        )
-
-        self._episode_sums["side_left_lead_displacement_ok_debug"] += (
-            side_left_lead_displacement_ok.float()
-        )
-        self._episode_sums["side_right_lead_displacement_ok_debug"] += (
-            side_right_lead_displacement_ok.float()
-        )
-
-        self._episode_sums["side_left_lead_open_ok_debug"] += (
-            side_left_lead_open_ok.float()
-        )
-        self._episode_sums["side_right_lead_open_ok_debug"] += (
-            side_right_lead_open_ok.float()
-        )
-
-        self._episode_sums["side_left_lead_order_ok_debug"] += (
-            side_left_lead_order_ok.float()
-        )
-        self._episode_sums["side_right_lead_order_ok_debug"] += (
-            side_right_lead_order_ok.float()
-        )
-
-        self._episode_sums["side_left_lead_physical_step_debug"] += (
-            (side_expect_left_lead & left_side_physical_step).float()
-        )
-        self._episode_sums["side_right_lead_physical_step_debug"] += (
-            (side_expect_right_lead & right_side_physical_step).float()
-        )
-
-        # Suma wartości w momentach touchdown; po podzieleniu przez
-        # *_attempt_debug dostajemy średni peak clearance / displacement
-        # na próbę wykonania kroku.
-        self._episode_sums["side_left_lead_max_clearance_event_debug"] += (
-            (left_side_clearance_quality * self.cfg.side_clearance_target)
-            * side_left_lead_attempt.float()
-        )
-        self._episode_sums["side_right_lead_max_clearance_event_debug"] += (
-            (right_side_clearance_quality * self.cfg.side_clearance_target)
-            * side_right_lead_attempt.float()
-        )
-        self._episode_sums["side_left_lead_displacement_event_debug"] += (
-            left_side_displacement * side_left_lead_attempt.float()
-        )
-        self._episode_sums["side_right_lead_displacement_event_debug"] += (
-            right_side_displacement * side_right_lead_attempt.float()
-        )
-
         # ============================================================
         # PURE YAW TURN DEBUG
         # ============================================================
@@ -7710,138 +7538,6 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
             torch.abs(joint_delta_all[:, self.turn_r_idx])
             * yaw_turn_cmd_gate
             * self.step_dt
-        )
-
-        # ------------------------------------------------------------
-        # DIAGNOSTYKA YAW: +yaw / -yaw oraz realny krok L/P.
-        # TYLKO LOGI - nie zmienia rewardu ani sterowania.
-        # ------------------------------------------------------------
-        yaw_plus = (
-            yaw_turn_active
-            & (self._commands[:, 2] > 0.0)
-        )
-        yaw_minus = (
-            yaw_turn_active
-            & (self._commands[:, 2] < 0.0)
-        )
-
-        self._episode_sums["yaw_plus_fraction_debug"] += (
-            yaw_plus.float() * self.step_dt
-        )
-        self._episode_sums["yaw_minus_fraction_debug"] += (
-            yaw_minus.float() * self.step_dt
-        )
-
-        # Dodatnia wartość = obrót zgodny z komendą dla obu znaków.
-        yaw_rate_along_cmd = yaw_turn_sign * yaw_rate
-        self._episode_sums["yaw_plus_rate_debug"] += (
-            yaw_rate_along_cmd * yaw_plus.float() * self.step_dt
-        )
-        self._episode_sums["yaw_minus_rate_debug"] += (
-            yaw_rate_along_cmd * yaw_minus.float() * self.step_dt
-        )
-
-        self._episode_sums["yaw_plus_left_step_debug"] += (
-            left_yaw_real_step * yaw_plus.float()
-        )
-        self._episode_sums["yaw_plus_right_step_debug"] += (
-            right_yaw_real_step * yaw_plus.float()
-        )
-        self._episode_sums["yaw_minus_left_step_debug"] += (
-            left_yaw_real_step * yaw_minus.float()
-        )
-        self._episode_sums["yaw_minus_right_step_debug"] += (
-            right_yaw_real_step * yaw_minus.float()
-        )
-
-        self._episode_sums["yaw_plus_left_arc_debug"] += (
-            left_swing.float()
-            * torch.clamp(left_yaw_signed_arc, min=0.0)
-            * yaw_plus.float()
-            * self.step_dt
-        )
-        self._episode_sums["yaw_plus_right_arc_debug"] += (
-            right_swing.float()
-            * torch.clamp(right_yaw_signed_arc, min=0.0)
-            * yaw_plus.float()
-            * self.step_dt
-        )
-        self._episode_sums["yaw_minus_left_arc_debug"] += (
-            left_swing.float()
-            * torch.clamp(left_yaw_signed_arc, min=0.0)
-            * yaw_minus.float()
-            * self.step_dt
-        )
-        self._episode_sums["yaw_minus_right_arc_debug"] += (
-            right_swing.float()
-            * torch.clamp(right_yaw_signed_arc, min=0.0)
-            * yaw_minus.float()
-            * self.step_dt
-        )
-
-        # ------------------------------------------------------------
-        # YAW GATE/QUALITY PIPELINE
-        #
-        # Porównujemy oba touchdowny i czynniki składające się na
-        # left_yaw_real_step / right_yaw_real_step.
-        # Wartości quality sumujemy tylko w momencie first-contact,
-        # więc później można je podzielić przez *_first_contact_debug.
-        # TYLKO DIAGNOSTYKA.
-        # ------------------------------------------------------------
-        yaw_left_first_contact = (
-            yaw_turn_active & left_first_contact_bw
-        )
-        yaw_right_first_contact = (
-            yaw_turn_active & right_first_contact_bw
-        )
-
-        self._episode_sums["yaw_left_first_contact_debug"] += (
-            yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_first_contact_debug"] += (
-            yaw_right_first_contact.float()
-        )
-
-        self._episode_sums["yaw_left_other_contact_ok_debug"] += (
-            (yaw_left_first_contact & right_contact).float()
-        )
-        self._episode_sums["yaw_right_other_contact_ok_debug"] += (
-            (yaw_right_first_contact & left_contact).float()
-        )
-
-        self._episode_sums["yaw_left_arc_quality_event_debug"] += (
-            left_yaw_arc_quality * yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_arc_quality_event_debug"] += (
-            right_yaw_arc_quality * yaw_right_first_contact.float()
-        )
-
-        self._episode_sums["yaw_left_air_quality_event_debug"] += (
-            left_yaw_air_quality * yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_air_quality_event_debug"] += (
-            right_yaw_air_quality * yaw_right_first_contact.float()
-        )
-
-        self._episode_sums["yaw_left_lift_quality_event_debug"] += (
-            left_yaw_lift_quality * yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_lift_quality_event_debug"] += (
-            right_yaw_lift_quality * yaw_right_first_contact.float()
-        )
-
-        self._episode_sums["yaw_left_peak_quality_event_debug"] += (
-            left_yaw_peak_quality * yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_peak_quality_event_debug"] += (
-            right_yaw_peak_quality * yaw_right_first_contact.float()
-        )
-
-        self._episode_sums["yaw_left_direction_quality_event_debug"] += (
-            yaw_turn_direction_quality * yaw_left_first_contact.float()
-        )
-        self._episode_sums["yaw_right_direction_quality_event_debug"] += (
-            yaw_turn_direction_quality * yaw_right_first_contact.float()
         )
 
         self._episode_sums["side_phase_trail_debug"] += (
@@ -8033,6 +7729,46 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
                 * self.step_dt
         )
 
+        # ============================================================
+        # SIM2REAL diagnostics - wartości średnie w czasie epizodu.
+        # ============================================================
+        self._episode_sums["sim2real_action_delay_debug"] += (
+            self._sim2real_action_delay_steps.float()
+            * self.step_dt
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_observation_delay_debug"] += (
+            self._sim2real_obs_delay_steps.float()
+            * self.step_dt
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_motor_scale_error_debug"] += (
+            torch.mean(
+                torch.abs(self._sim2real_motor_scale - 1.0), dim=1
+            )
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_motor_zero_offset_debug"] += (
+            torch.mean(
+                torch.abs(self._sim2real_motor_zero_offset), dim=1
+            )
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_slew_scale_error_debug"] += (
+            torch.abs(self._sim2real_slew_scale[:, 0] - 1.0)
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_gyro_bias_debug"] += (
+            torch.mean(torch.abs(self._sim2real_gyro_bias), dim=1)
+            * self.step_dt
+        )
+        self._episode_sums["sim2real_joint_pos_bias_debug"] += (
+            torch.mean(
+                torch.abs(self._sim2real_joint_pos_bias), dim=1
+            )
+            * self.step_dt
+        )
+
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -8113,6 +7849,11 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+        # Nowa "maszyna" elektroniczna/sensoryczna na każdy epizod.
+        # Fizyczne parametry (masa/tarcie/gainy) są rozproszone między envami
+        # przez EventCfg przy starcie.
+        self._sample_sim2real_episode_params(env_ids)
+
         self._prev_root_pos[env_ids] = default_root_state[:, :3]
 
         self._left_foot_contact.reset(env_ids)
@@ -8189,3 +7930,821 @@ class InzynierkaizaklaboratoriumEnv(DirectRLEnv):
         self.extras["log"]["Episode_Termination/time_out"] = (
             torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         )
+
+
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+from isaaclab.utils import configclass
+import isaaclab.envs.mdp as mdp
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+
+from isaaclab_assets.robots.inzynierka import PORZADKI_ROBOT_CFG
+
+
+@configclass
+class EventCfg:
+    """SIM2REAL STAGE 1: łagodna randomizacja fizyki między równoległymi robotami."""
+
+    # Tarcie podeszwy / podłoża. Ground ma współczynnik 1.0 i combine=multiply,
+    # więc ten zakres jest w praktyce zakresem efektywnego tarcia stopy.
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.85, 1.15),
+            "dynamic_friction_range": (0.65, 0.85),
+            "restitution_range": (0.0, 0.03),
+            "num_buckets": 64,
+        },
+    )
+
+    # Każdy równoległy robot ma trochę inną masę segmentów.
+    # Na Stage 1 tylko +/-5%, żeby nie zniszczyć już nauczonych gaitów.
+    body_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "mass_distribution_params": (0.95, 1.05),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    # Różnice serw / zasilania / regulatorów.
+    actuator_gains = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (0.90, 1.10),
+            "damping_distribution_params": (0.90, 1.10),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+
+    # Niewielkie różnice tarcia/armature w osiach. Jeżeli nominalna wartość
+    # danego parametru wynosi 0, samo skalowanie pozostawi ją równą 0.
+    joint_dynamics = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "friction_distribution_params": (0.90, 1.10),
+            "armature_distribution_params": (0.95, 1.05),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+
+
+@configclass
+class InzynierkaizaklaboratoriumEnvCfg(DirectRLEnvCfg):
+    episode_length_s = 10.0
+    decimation = 4
+    action_space = 10
+
+    # 3 ang vel + 3 gravity + 3 commands
+    # + 10 joint pos + 10 joint vel + 10 actions = 39
+    observation_space = 39
+    state_space = 0
+
+    # Pełny zakres ruchu potrzebny do zginania kolan.
+    action_scale = 0.5
+
+    # Górne przeguby obrotowe obrot1/obrot2 były celowo ograniczone do 0.08 rad.
+    # Zachowujemy tę ochronę dla starego forward/backward/side, żeby nie
+    # rozwalić wyuczonych gaitów. Przy PURE YAW odblokowujemy je mocniej.
+    turn_action_scale_locomotion = 0.08
+    turn_action_scale_yaw = 0.50
+
+    # Przy PURE YAW górne przeguby dostają też szybszą odpowiedź celu.
+    # Reszta chodu nadal używa starego target_filter_alpha = 0.20.
+    turn_target_filter_alpha_yaw = 0.40
+
+    # ============================================================
+    # SIM2REAL - STAGE 1 (ŁAGODNY)
+    #
+    # Fizyka (masa/tarcie/gainy) jest losowana w EventCfg przy starcie.
+    # Poniższe parametry są losowane per epizod na GPU i symulują
+    # elektronikę, opóźnienia, kalibrację i sensory.
+    # ============================================================
+    sim2real_enable = True
+
+    # PLAY z 1 env pozostaje czysty i powtarzalny. Randomizacja per-episode
+    # działa tylko podczas treningu wielośrodowiskowego. EventCfg nadal
+    # randomizuje fizykę przy starcie także w PLAY - to jest łagodny test
+    # odporności mechanicznej, ale bez losowego delay/noise w każdej klatce.
+    sim2real_training_only = True
+
+    # 1 krok sterowania = decimation * sim.dt = 4/120 = 33.3 ms.
+    # Stage 1: część robotów ma jeden krok opóźnienia, większość zero.
+    sim2real_action_delay_max_steps = 1
+    sim2real_action_delay_probability = 0.15
+    sim2real_observation_delay_max_steps = 1
+    sim2real_observation_delay_probability = 0.05
+
+    # Różnice napędów per epizod/per joint: amplituda celu, offset zera
+    # i maksymalna szybkość zmiany targetu.
+    sim2real_motor_scale_min = 0.97
+    sim2real_motor_scale_max = 1.03
+    sim2real_motor_zero_offset_max = 0.006   # rad ~= 0.34 deg
+    sim2real_slew_scale_min = 0.90
+    sim2real_slew_scale_max = 1.10
+
+    # Biasy są stałe przez epizod, noise jest biały w każdej obserwacji.
+    sim2real_gyro_bias_max = 0.006           # rad/s
+    sim2real_gyro_noise_std = 0.012          # rad/s
+    sim2real_gravity_noise_std = 0.006       # projected gravity component
+    sim2real_joint_pos_bias_max = 0.005      # rad ~= 0.29 deg
+    sim2real_joint_pos_noise_std = 0.003     # rad
+    sim2real_joint_vel_noise_std = 0.040     # rad/s
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 120.0,
+        render_interval=decimation,
+        gravity=(0.0, 0.0, -9.81),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+    )
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=4096,
+        env_spacing=2.0,
+        replicate_physics=True,
+    )
+
+    events: EventCfg = EventCfg()
+    robot_cfg: ArticulationCfg = PORZADKI_ROBOT_CFG.replace(
+        prim_path="/World/envs/env_.*/Robot"
+    )
+
+    # Kontakt stóp tylko do rewardu, NIE do obserwacji policy.
+    left_foot_contact = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/porzadki_skrecajacy_urdf_export/stopaL_1",
+        update_period=0.0,
+        history_length=3,
+        track_air_time=True,
+        force_threshold=1.0,
+        debug_vis=False,
+    )
+
+    right_foot_contact = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/porzadki_skrecajacy_urdf_export/stopaR_1",
+        update_period=0.0,
+        history_length=3,
+        track_air_time=True,
+        force_threshold=1.0,
+        debug_vis=False,
+    )
+
+    # Reset / terminacja.
+    base_height_target = 0.2
+    base_height_fall = 0.110
+    max_tilt_error = 0.75
+    reset_joint_noise = 0.04
+    target_filter_alpha = 0.20
+
+    # Startujemy od prostego chodu do przodu.
+    # Cały reward i obserwacje są już 2D+yaw, więc później zmieniasz tylko
+    # command_mode na "omni" bez przebudowy sieci.
+    command_mode = "forward_backward_side_yaw"
+
+    # Komenda używana przy num_envs == 1 (PLAY / szybki test checkpointu).
+    # STAGE TURN: czysty obrót w miejscu, bez translacji.
+    play_command_x = 0.0
+    play_command_y = 0.0
+    play_command_yaw = 0.45
+
+    # Zostawione dla kompatybilności ze starszym kodem/testami.
+    forward_command_x = -0.02  # docelowo 0.12
+
+    # TRAINING: losowana prędkość do przodu.
+    # forward_command_min = 0.08
+    # forward_command_max = 0.15
+    #
+    # # 15% komend = stanie w miejscu.
+    # standing_command_probability = 0.15
+    # Zakres prędkości podczas treningu.
+    forward_command_min = 0.08
+    forward_command_max = 0.15
+
+    # 15% wylosowanych komend = stanie w miejscu.
+    standing_command_probability = 0.10
+    command_resample_time_s = 10
+
+    # Gotowe zakresy na późniejszy etap omnidirectional.
+    omni_min_speed = 0.08
+    omni_max_speed = 0.22
+    omni_max_yaw_rate = 0.70
+
+    # ============================================================
+    # GAMEPAD / PLAY
+    #
+    # Lewy analog:
+    #   góra/dół   -> forward/backward
+    #   lewo/prawo -> side
+    #
+    # LT -> obrót w lewo
+    # RT -> obrót w prawo
+    #
+    # Zakresy są zgodne z tym, czego policy faktycznie się uczyła.
+    # ============================================================
+    gamepad_deadzone = 0.15
+    gamepad_trigger_deadzone = 0.05
+
+    gamepad_forward_speed = 0.15
+    gamepad_backward_speed = 0.025
+    gamepad_side_speed = 0.045
+    gamepad_yaw_rate = 0.45
+
+    # Na razie nie łączymy translacji z yaw, bo policy trenowała
+    # osobno forward/backward/side i pure-yaw.
+    gamepad_pure_modes_only = False
+
+    # Legacy compatibility.
+    gamepad_max_lin_speed = 0.15
+    gamepad_max_yaw_rate = 0.45
+
+    # Reward CLEAN WALK V1.
+    lin_vel_tracking_sigma = 0.02
+    yaw_vel_tracking_sigma = 0.100
+
+    rew_scale_alive = 0.20
+    rew_scale_terminated = -20.0
+
+    rew_scale_track_lin_vel_xy = 12.0
+    rew_scale_track_yaw_vel = 3.0
+
+    rew_scale_orientation = -1.0
+    rew_scale_lin_vel_z = -0.25
+    rew_scale_ang_vel_xy = -0.15
+
+    # Delikatne anty-exploity, bez narzucania fazy chodu.
+    rew_scale_both_feet_air = -5
+    rew_scale_foot_slip = -0.15
+
+    # Minimalna regularizacja; slew limiter robi większość ochrony serw.
+    rew_scale_action_rate = -0.01
+    # --- NATURALNY KROK / ZGINANIE NOGI ---
+    swing_clearance_target = 0.04  # 4 cm wystarczy; nie robimy bociana było 0,025
+    swing_min_time = 0.12  # krótsze oderwanie = raczej drganie # z 0,08 na 0,12
+    swing_max_time = 0.45  # nie opłaca się wisieć na jednej nodze
+
+    # Zgięcie "duckowe" kolana nogi przenoszonej.
+    # 0.35 rad ~= 20 stopni.
+    swing_knee_flex_target = 0.15
+    rew_scale_swing_knee_flex = 1.0
+
+    rew_scale_swing_clearance = 4.0
+    rew_scale_step_complete = 8.0
+    rew_scale_forward_progress = 14.0
+
+    # Kara za "jazdę" przez długi czas z obiema stopami przyklejonymi.
+    rew_scale_double_support_stuck = -4.0
+    # Normalny chód może mieć krótki double-support.
+    # Karzemy dopiero przedłużone stanie na obu stopach.
+    double_support_grace_time = 0.20
+    double_support_full_penalty_time = 0.50
+
+    # Nie pozwalamy też wisieć wiecznie na jednej nodze.
+    rew_scale_overlong_swing = -2.0
+    rew_scale_lateral_vel = -25.0
+    lateral_vel_sigma = 0.01
+    lateral_vel_deadzone = 0.03
+    rew_scale_yaw_rate = -15.0
+    # Kara za długookresowe odpływanie w bok.
+    # rew_scale_lateral_bias = -200.0
+
+    # Filtr EMA bocznej prędkości.
+    # lateral_bias_alpha = 0.05
+    swing_balance_alpha = 0.03
+    rew_scale_swing_balance = -40.0
+    straightness_lateral_sigma = 0.035
+    straightness_yaw_sigma = 0.12
+
+    step_straightness_floor = 0.20
+    progress_straightness_floor = 0.35
+
+    lateral_bias_alpha = 0.03
+    lateral_bias_deadband = 0.015
+    rew_scale_lateral_bias = -50.0
+    knee_balance_alpha = 0.03
+    rew_scale_knee_flex_balance = -4.0
+
+    rew_scale_knee_pair_use = 4.0
+
+    roll_bias_alpha = 0.03
+    roll_bias_deadband = 0.010
+    roll_bias_sigma = 0.06
+    rew_scale_roll_bias = -40.0
+
+    # --- STANDING ---
+    # Miękkie trzymanie pozycji neutralnej tylko dla cmd = 0.
+    stand_pose_sigma = 0.025
+    stand_height_sigma = 0.025
+
+    rew_scale_stand_pose = 0.0
+    rew_scale_stand_height = 0.0
+    rew_scale_stand_joint_vel = 0.0
+    rew_scale_stand_double_contact = 2.0
+
+    rew_scale_stand_lin_vel = -10.0
+    rew_scale_stand_yaw_vel = -4.0
+    rew_scale_stand_upright = -10.0
+    rew_scale_stand_action = 0.0
+    # CHCEMY DWIE STOPY NA ZIEMI.
+    rew_scale_stand_single_support = -2.0
+    # --- STANDING ---
+
+    # stand_height_sigma = 0.025
+    #
+    # rew_scale_stand_pose = 0.0
+    # rew_scale_stand_height = 0.0
+    #
+    # # Może aktywnie pracować nogami żeby nie upaść.
+    # rew_scale_stand_joint_vel = 0.0
+    # rew_scale_stand_action = 0.0
+    #
+    # # Dwie stopy mają być na ziemi.
+    # rew_scale_stand_double_contact = 2.0
+    # rew_scale_stand_single_support = -2.0
+    #
+    # # Nie odjeżdżaj i nie obracaj się.
+    # rew_scale_stand_lin_vel = -10.0
+    # rew_scale_stand_yaw_vel = -4.0
+    #
+    # # Baza pionowo.
+    # rew_scale_stand_upright = -10.0
+
+    # Obie nogi mają mieć podobne zgięcie kolana.
+    stand_knee_sym_deadband = 0.08
+    rew_scale_stand_knee_sym = -6.0
+    # rew_scale_stand_obrot10 = -8.0
+
+    stand_ankle_sym_deadband = 0.02
+
+    rew_scale_stand_ankle_sym = 0.0
+    # rew_scale_stand_obrot9_extra = -10.0
+
+    # --- PŁASKIE STOPY PODCZAS STANIA ---
+    stand_foot_flat_deadband_deg = 4.0
+    rew_scale_stand_foot_flat = -15.0
+
+    # backward_command_min = 0.04
+    # backward_command_max = 0.04
+    #
+    # # Spośród KOMEND RUCHU 1/3 będzie do tyłu.
+    # # Przy stand=25% daje około:
+    # # 25% stand
+    # # 25% backward
+    # # 50% forward
+    # backward_probability = 0.90
+    # rew_scale_backward_discovery = 0.0
+    # # rew_scale_backward_track = 10.0
+    # # backward_tracking_sigma = 0.003
+    #
+    # command_move_threshold = 0.01
+    #
+    # rew_scale_backward_signed_progress = 0.0
+    #
+    # backward_velocity_ema_alpha = 0.05
+    #
+    # rew_scale_backward_track = 0.0
+    # backward_tracking_sigma = 0.0006
+    #
+    # backward_foot_placement_sigma = 0.015
+    # backward_foot_placement_floor = 0.25
+    # # NOWE: prawdziwy krok.
+    # rew_scale_backward_real_step = 30.0
+    #
+    # # NOWE: nie wolno zdobywać cofania przez telepanie na 2 stopach.
+    # rew_scale_backward_shuffle = -8.0
+    #
+    # backward_double_support_grace = 0.10
+    # backward_double_support_full = 0.35
+
+    # # ============================================================
+    # # BACKWARD - STAGE 1: NAUKA PRAWDZIWEGO KROKU
+    # # ============================================================
+    #
+    # backward_command_min = 0.04
+    # backward_command_max = 0.04
+    #
+    # backward_probability = 0.80
+    #
+    # command_move_threshold = 0.01
+    #
+    # # Na STAGE 1 NIE płacimy za prędkość do tyłu.
+    # rew_scale_backward_discovery = 0.0
+    # rew_scale_backward_signed_progress = 0.0
+    # rew_scale_backward_track = 0.0
+    #
+    # backward_velocity_ema_alpha = 0.05
+    # backward_tracking_sigma = 0.0006
+    #
+    # # Prawdziwy swing:
+    # # brak kontaktu + druga noga podpiera + min. 4 mm fizycznego liftu.
+    # backward_real_lift_min = 0.004
+    #
+    # # Małe kroki do tyłu.
+    # backward_step_min_time = 0.08
+    # backward_step_max_time = 0.25
+    #
+    # # Ile nagradzamy sam REALNY single support.
+    # rew_scale_backward_single_support = 8
+    #
+    # # Główna nagroda za prawidłowy naprzemienny krok.
+    # rew_scale_backward_alt_step = 12.0
+    #
+    # # Kara za realny, ale za krótki mikrokrok.
+    # rew_scale_backward_premature_touchdown = -0.5
+    #
+    # # Kara za przesuwanie stopy będącej na ziemi.
+    # rew_scale_backward_contact_slip = -4.0
+    #
+    # # Kara za jazdę bazą do tyłu przy długim double-support.
+    # rew_scale_backward_shuffle = -4.0
+    #
+    # backward_shuffle_grace = 0.10
+    # backward_shuffle_full = 0.25
+    #
+    # # ============================================================
+    # # BACKWARD STAGE 1 - MAŁE NORMALNE KROKI
+    # # ============================================================
+    #
+    # # Oficjalny-style biped single stance.
+    # backward_air_time_target = 0.10
+    #
+    # # Mała marchewka za odciążenie jednej nogi.
+    # rew_scale_backward_load_transfer = 0.75
+    #
+    # ============================================================
+    # BACKWARD CURRICULUM V1
+    # Zachowujemy działający gait forward i uczymy go
+    # stopniowo dla małych ujemnych komend.
+    # ============================================================
+
+    # Pierwszy etap: naprawdę małe cofanie.
+    # command_move_threshold = 0.01, więc nie schodzimy do 0.01.
+    backward_command_min = 0.015
+    backward_command_max = 0.025
+
+    # 10% stand zostaje.
+    # Z pozostałych 90%:
+    # ~45% forward
+    # ~45% backward
+    backward_probability = 0.50
+
+    command_move_threshold = 0.01
+
+    # Stare backward velocity rewards na razie wyłączone.
+    # Kierunek daje nam command-relative progress.
+    rew_scale_backward_discovery = 0.0
+    rew_scale_backward_signed_progress = 0.0
+    rew_scale_backward_track = 0.0
+
+    backward_velocity_ema_alpha = 0.05
+    backward_tracking_sigma = 0.0006
+
+    # Nadal używane przez istniejące obliczenia/debug.
+    backward_foot_placement_sigma = 0.015
+    backward_foot_placement_floor = 0.25
+
+    # Stare eksperymentalne rewardy WYŁĄCZONE.
+    # Kod może sobie na razie istnieć, ale nie steruje uczeniem.
+    backward_real_lift_min = 0.004
+    backward_step_min_time = 0.08
+    backward_step_max_time = 0.25
+    backward_air_time_target = 0.10
+
+    rew_scale_backward_single_support = 0.0
+    rew_scale_backward_alt_step = 0.0
+    rew_scale_backward_premature_touchdown = 0.0
+    rew_scale_backward_load_transfer = 0.0
+
+    # ------------------------------------------------------------
+    # NOWY CURRICULUM
+    # ------------------------------------------------------------
+
+    # Legacy heading-relative forward_progress is disabled for backward.
+    # Backward now has its own reward for WORLD-axis velocity.
+    # Forward retains 100% of its existing progress reward.
+    backward_progress_scale = 0.0
+
+    # Małe kroczki są OK.
+    backward_step_air_target = 0.10
+
+    # 2 cm = pełna jakość placementu.
+    # 1-5 mm nadal daje częściowy reward.
+    backward_step_placement_target = 0.015
+
+    # Dense: noga podczas swingu idzie w stronę komendy.
+    rew_scale_backward_swing_direction = 4.0
+
+    # Event: po swingu stopa ląduje ZA podporową
+    # w kierunku cofania.
+    rew_scale_backward_step_direction = 2.0  # bootstrap; real cycle pays more
+
+    # Anty-szuranie zostaje.
+    rew_scale_backward_contact_slip = -6.0
+    rew_scale_backward_shuffle = -8.0
+
+    backward_shuffle_grace = 0.10
+    backward_shuffle_full = 0.25
+
+    # Małe kroczki są OK.
+    backward_air_deadband = 0.04
+
+    # ============================================================
+    # BACKWARD STRAIGHTENING
+    # Nie tworzymy osobnego rewardu za "stanie prosto".
+    # Prostota BRAMKUJE tylko istniejące rewardy backward gait.
+    # ============================================================
+
+    # Boczne przesuwanie podczas backward.
+    # 0.00 m/s -> factor 1.0
+    # 0.01 m/s -> ~0.78
+    # 0.02 m/s -> ~0.37
+    backward_straight_lateral_sigma = 0.020
+
+    # Yaw podczas backward.
+    # 0.00 rad/s -> factor 1.0
+    # 0.05 rad/s -> ~0.78
+    # 0.10 rad/s -> ~0.37
+    backward_straight_yaw_sigma = 0.10
+
+    # Nie zerujemy całkowicie rewardu przy krzywej próbie,
+    # bo nie chcemy zabić dopiero co odkrytego backward gait.
+    backward_swing_straightness_floor = 0.25
+    backward_step_straightness_floor = 0.10
+
+    # ============================================================
+    # BACKWARD - WYMUSZENIE NAPRZEMIENNEJ PRACY NÓG
+    # ============================================================
+
+    # Gdy jest kolej konkretnej nogi, jej prawdziwy swing
+    # jest bardziej wartościowy.
+    backward_expected_swing_scale = 1.50
+
+    # Jeśli agent próbuje ponownie użyć tej samej nogi,
+    # dense swing reward prawie znika.
+    backward_repeat_swing_scale = 0.0
+
+    # Powtórzony touchdown tej samej nogi nadal dostaje
+    # minimalny reward, żeby nie zrobić twardej ściany.
+    backward_repeat_step_scale = 0.0
+
+    # Po kroku jednej nogi nagradzamy PRAWDZIWE oderwanie
+    # oczekiwanej przeciwnej nogi.
+    rew_scale_backward_expected_swing_lift = 2.5
+
+    # Jeżeli oczekiwana noga zamiast się oderwać szura po ziemi.
+    rew_scale_backward_expected_foot_slip = -8.0
+
+    # ============================================================
+    # BACKWARD - PRAWDZIWE UŻYWANIE OBU NÓG
+    # ============================================================
+
+    backward_real_pair_alpha = 0.03
+    backward_real_pair_target = 0.08
+
+    rew_scale_backward_real_pair_use = 3.0  # support shaping, not main goal
+    rew_scale_backward_real_swing_balance = -6.0
+
+    backward_real_lift_target = 0.025  # 25 mm = pełna jakość
+
+    # NOWE: ukończony prawdziwy NAPRZEMIENNY krok.
+    rew_scale_backward_real_alt_step = 8.0
+
+    # NOWE: jeśli robot jedzie dzięki "pchaniu" przy słabym użyciu obu nóg.
+    rew_scale_backward_push_glide = -6.0
+
+    # Oczekiwana noga ma zginać kolano podczas prawdziwego swingu.
+    rew_scale_backward_expected_knee_flex = 2.0
+
+    # Backward-specific actual knee flex -> partial extension.
+    # Left flex = +delta, right flex = -delta.
+    backward_knee_flex_target = 0.12        # rad, extra flex after liftoff
+    backward_knee_extension_target = 0.08  # rad, extension from swing peak
+    backward_knee_min_flex = 0.035         # rad, cycle event minimum
+    backward_knee_min_extension = 0.020   # rad, cycle event minimum
+    backward_cycle_lift_min = 0.010        # m, only accepted step
+    rew_scale_backward_knee_extension = 3.0
+
+
+
+
+
+
+
+    # ============================================================
+    # BACKWARD: FIXED WORLD HEADING + WORLD-AXIS VELOCITY
+    # Keeps observation_space=39: correction uses existing cmd yaw channel.
+    # ============================================================
+    backward_heading_kp = 1.5                  # 1/s, yaw-rate = kp * heading error
+    backward_heading_max_yaw_rate = 0.40       # rad/s, only during backward
+    backward_heading_deadband = 0.035          # rad (~2 deg)
+    backward_heading_penalty_span = 0.50       # rad after deadband -> full loss
+    backward_heading_quality_sigma = 0.60     # rad, attenuate gait rewards on turns
+    backward_heading_gait_floor = 0.15        # still enough gradient at bad yaw
+    backward_heading_fail_angle = 1.00        # rad (~57 deg), backward only
+    rew_scale_backward_heading_hold = -3.0
+
+    # Move in the requested direction in the ORIGINAL world heading,
+    # not in the robot's rotated frame. Zero for no backward motion.
+    backward_axis_speed_sigma = 0.070         # m/s, gradual overspeed reduction
+    backward_axis_lateral_sigma = 0.08        # m/s, gradual lateral reduction
+    rew_scale_backward_axis_track = 5.0
+
+    # ============================================================
+    # BACKWARD WORLD-LINE HOLD
+    # Robot ma nie tylko patrzeć w dobrym kierunku,
+    # ale również pozostać na linii, z której rozpoczął cofanie.
+    # ============================================================
+
+    # PD -> korekcyjna komenda cmd_y.
+    backward_line_kp = 0.80
+    backward_line_kd = 0.35
+
+    backward_line_pos_deadband = 0.010  # 1 cm
+    backward_line_vel_deadband = 0.020  # 2 cm/s
+
+    # Nie każemy mu gwałtownie wracać na linię.
+    backward_line_max_lateral_cmd = 0.08  # m/s
+
+    # Jakość toru używana do bramkowania dużych rewardów kroku.
+    backward_line_velocity_scale = 0.08  # m/s
+    backward_line_position_scale = 0.06  # m
+    backward_line_reward_floor = 0.15
+
+    # Bezpośrednia kara za duży world-lateral drift.
+    backward_world_lateral_deadband = 0.03
+    backward_world_lateral_full = 0.20
+    rew_scale_backward_world_lateral = -2.0
+
+    # ============================================================
+    # SIDE WALK - STAGE 1
+    #
+    # Zachowujemy wyuczony forward / backward / stand i dokładamy
+    # małe, czyste komendy +/-Y bez obracania kadłuba.
+    # ============================================================
+
+    # Spośród komend RUCHU 35% to side.
+    # Przy standing_command_probability = 0.10 daje około:
+    # 31.5% side, 29.25% forward, 29.25% backward, 10% stand.
+    # W STAGE TURN side zajmuje 30% komend ruchu; yaw ma osobne 35%.
+    side_probability = 0.30
+
+    # Na start małe prędkości, żeby wykorzystać transfer istniejącego gaitu.
+    side_command_min = 0.025
+    side_command_max = 0.045
+
+    # ============================================================
+    # SIDE STEP-TOGETHER ("ODSTAWNO-DOSTAWNY")
+    #
+    # +Y: lewa noga odstawia -> prawa dostawia
+    # -Y: prawa noga odstawia -> lewa dostawia
+    #
+    # Pełna nagroda wymaga:
+    # - ruchu stopy W BOK zgodnie z komendą,
+    # - realnego liftu,
+    # - braku krzyżowania nóg,
+    # - małego rozjazdu przód/tył stóp,
+    # - po "odstawieniu" zwiększenia rozstawu,
+    # - po "dostawieniu" powrotu do normalnego rozstawu.
+    # ============================================================
+
+    side_air_deadband = 0.04
+    side_air_target = 0.12
+
+    side_step_displacement_min = 0.010       # 1 cm: minimalny realny krok w bok
+    side_step_displacement_target = 0.035    # 3.5 cm: pełna jakość przesunięcia stopy
+
+    side_min_clearance = 0.010               # 1 cm: stopa musi się realnie oderwać
+    side_clearance_target = 0.025            # 2.5 cm: pełna jakość liftu
+
+    side_open_width_min = 0.010              # lead foot musi realnie "otworzyć" rozstaw
+    side_open_width_target = 0.025           # 2.5 cm dodatkowego rozstawu = pełna jakość
+
+    side_close_width_sigma = 0.018           # trailing foot ma wrócić do rozstawu bazowego
+    side_close_accept_error = 0.025          # max błąd rozstawu przy zaakceptowanym "dostaw"
+
+    side_min_width_ratio = 0.55              # nogi nie mogą się skrzyżować / zapaść do środka
+
+    # Stopy mają być obok siebie w osi X, nie jedna wyraźnie "z przodu".
+    side_fore_aft_deadband = 0.015           # 1.5 cm bez kary
+    side_fore_aft_full = 0.060               # 6 cm = pełna kara
+    side_fore_aft_quality_scale = 0.035
+
+    # Generic step_complete zostawiamy jako bootstrap, ale główną nagrodą
+    # ma być teraz poprawna sekwencja ODSTAW -> DOSTAW.
+    side_generic_step_scale = 0.20
+
+    rew_scale_side_expected_swing = 3.0
+    rew_scale_side_lead_step = 6.0
+    rew_scale_side_trail_step = 10.0
+    rew_scale_side_fore_aft = -6.0
+    rew_scale_side_narrow_stance = -6.0
+
+    # Heading hold: side ma być translacją +/-Y bez obracania robota.
+    # Używa tego samego world-heading reference zapisanego na resecie.
+    side_heading_kp = 1.50
+    side_heading_max_yaw_rate = 0.30
+    side_heading_deadband = 0.035
+    side_heading_penalty_span = 0.50
+    side_heading_fail_angle = 1.00
+    rew_scale_side_heading_hold = -2.0
+
+    # Chód boczny wymaga świadomego transferu ciężaru w roll.
+    # Nie wyłączamy ochrony roll, tylko osłabiamy ją podczas pure-side.
+    side_roll_penalty_scale = 0.35
+
+    # Dodatkowa kara za przesuwanie stopy po ziemi podczas side.
+    # Bazowy foot_slip nadal działa.
+    rew_scale_side_contact_slip = -6.0
+
+    # ============================================================
+    # PURE YAW TURN - STAGE 1
+    #
+    # Uczymy najpierw obrotu CAŁEJ BAZY w miejscu:
+    # cmd_x = 0, cmd_y = 0, cmd_yaw != 0.
+    # Dopiero po opanowaniu tego etapu połączymy yaw z translacją i padem.
+    # ============================================================
+
+    # Spośród wszystkich komend RUCHU 35% to czysty obrót.
+    # Przy stand=10%, side=30% daje w przybliżeniu:
+    # 31.5% yaw, 27% side, 15.75% forward, 15.75% backward, 10% stand.
+    yaw_turn_probability = 0.35
+
+    # FINAL TURN STAGE: szybszy, ale nadal rozsądny zakres.
+    # 0.25-0.55 rad/s ~= 14.3-31.5 deg/s. PLAY = 0.45 rad/s ~= 25.8 deg/s.
+    yaw_turn_command_min = 0.25
+    yaw_turn_command_max = 0.55
+
+    # ------------------------------------------------------------
+    # PRAWDZIWY KROK SKRĘTNY
+    # ------------------------------------------------------------
+    # Minimalny lokalny fore-aft arc swing-foot. Dla +yaw lewa idzie
+    # lekko w tył, prawa w przód; dla -yaw odwrotnie.
+    yaw_turn_arc_deadband = 0.006
+    yaw_turn_arc_target = 0.035
+
+    # Realny liftoff/air-time - nie nagradzamy szurania i mikro-touchdownów.
+    yaw_turn_lift_target = 0.018
+    yaw_turn_air_deadband = 0.045
+    yaw_turn_air_target = 0.14
+
+    # Górny yaw-joint może wyraźnie pracować w SWINGU.
+    # Po kontakcie duże wykręcenie staje się drogie, dzięki czemu noga
+    # podporowa prostuje obrot1/obrot2 i obraca nad nią bazę.
+    yaw_turn_hip_twist_deadband = 0.08
+    yaw_turn_hip_twist_target = 0.30
+    yaw_turn_stance_twist_deadband = 0.12
+    yaw_turn_stance_twist_full = 0.35
+
+    # Same-side repeat zachowuje mały discovery signal, pełna kasa jest
+    # za naprzemienny krok.
+    yaw_turn_repeat_scale = 0.15
+
+    # Dense discovery + real touchdown event + cykl swing/recenter.
+    rew_scale_yaw_turn_swing = 2.0
+    rew_scale_yaw_turn_swing_twist = 1.5
+    rew_scale_yaw_turn_step = 8.0
+    rew_scale_yaw_turn_stance_twist = -3.0
+
+    # Anty-exploity dla obrotu w miejscu.
+    rew_scale_yaw_turn_contact_slip = -8.0
+    rew_scale_yaw_turn_translation = -8.0
+
